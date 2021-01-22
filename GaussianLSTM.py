@@ -35,8 +35,12 @@ class GaussianLSTMCore(nn.Module):
         self.weight_ih = nn.Parameter(torch.Tensor(input_sz, hidden_sz * 4))
         self.weight_hh = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 4))
         self.noise = noise
-        if noise != "h": self.c_reparameterize = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 2))
-        if noise != "c": self.h_reparameterize = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 2))
+
+        if noise == ("c" or "both"):
+            self.c_reparameterize = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 2))
+        if noise == ("h" or "both"):
+            self.h_reparameterize = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 2))
+
         self.bias = nn.Parameter(torch.Tensor(hidden_sz * 4))
         self.init_weights()
 
@@ -46,13 +50,18 @@ class GaussianLSTMCore(nn.Module):
                 nn.init.xavier_uniform_(p.data)
             else:
                 nn.init.zeros_(p.data)
+        if hasattr(self,"h_reparameterize"):
+            scaling = torch.cat([torch.ones(self.hidden_size, self.hidden_size), torch.ones(self.hidden_size, self.hidden_size) * .000000001], dim=1)
+            self.h_reparameterize = torch.nn.Parameter(self.h_reparameterize * scaling)
+
+        if hasattr(self,"c_reparameterize"):
+            scaling = torch.cat([torch.ones(self.hidden_size, self.hidden_size), torch.ones(self.hidden_size, self.hidden_size) * .000000001], dim=1)
+            self.c_reparameterize = torch.nn.Parameter(self.c_reparameterize * scaling)
 
     def forward(self, x: torch.Tensor,
                 init_states=None):
         """Assumes x is of shape (batch, sequence, feature)"""
         bs, seq_sz, _ = x.size()
-        hidden_seq = []
-        c_seq = []
         c_stats = []
         h_stats = []
         if init_states is None:
@@ -60,6 +69,9 @@ class GaussianLSTMCore(nn.Module):
                         torch.zeros(self.hidden_size).to(x.device))
         else:
             h_t, c_t = init_states
+
+        hidden_seq = []
+        c_seq = []
 
         HS = self.hidden_size
         for t in range(seq_sz):
@@ -177,8 +189,8 @@ class LSTM(torch.nn.Module):
         # )
 
         self.initial_state = (
-            torch.autograd.Variable(torch.randn(self.num_layers, self.hidden_size)),
-            torch.autograd.Variable(torch.randn(self.num_layers, self.hidden_size))
+            torch.autograd.Variable(torch.randn(self.num_layers, self.hidden_size), requires_grad=True),
+            torch.autograd.Variable(torch.randn(self.num_layers, self.hidden_size), requires_grad=True)
         )
 
         self.decoder = torch.nn.Linear(self.hidden_size, self.vocab_size)
@@ -205,13 +217,13 @@ class LSTM(torch.nn.Module):
             h_mus.append(h_mu)
             h_stds.append(h_std)
 
-        # If noise flag "h"/"c", transforms them, otherwise don't touch becauses it's a NoneType
+        # If noise flag "h"/"c", transforms them, otherwise don't touch because it's a NoneType
 
-        if self.noise != "h":
+        if self.noise == ("c" or "both"):
             c_mus = torch.cat(c_mus, Dim.feature)
             c_stds = torch.cat(c_stds, Dim.feature)
 
-        if self.noise != "c":
+        if self.noise == ("h" or "both"):
             h_mus = torch.cat(h_mus, Dim.feature)
             h_stds = torch.cat(h_stds, Dim.feature)
 
@@ -222,12 +234,10 @@ class LSTM(torch.nn.Module):
         # And the last state is after consuming EOS, so it doesn't matter
         # So add the initial state in first, and remove the final state
 
-        return seq, c_seq, h_stats, c_stats
+        seq = torch.cat((init_h[-1].unsqueeze(-2), seq), dim=-2)[:, 0:-1, :]
+        c_seq = torch.cat((init_h[-1].unsqueeze(-2), c_seq), dim=-2)[:, 0:-1, :]
 
-    def reparameterize(self, mu, std):
-        eps = torch.autograd.Variable(std.data.new(std.size()).normal_())
-        # output noisy sampling of size B x T x H/2
-        return mu + eps * std
+        return seq, c_seq, h_stats, c_stats
 
     def decode(self, h):
         logits = self.decoder(h)
@@ -237,7 +247,7 @@ class LSTM(torch.nn.Module):
 
     def lm_loss(self, Y, Y_hat):
         # Y contains the target token indices. Shape B x T
-        # Y_hat contains distributions. Shape B x (T+1) x V
+        # Y_hat contains distributions. Shape B x (T+1) x V ??? (Doesn't appear to be true)
         Y_flat = Y.view(-1)  # flatten to B*T
         Y_hat_flat = Y_hat.view(-1, self.vocab_size)  # flatten to B*T x V
         mask = (Y_flat == self.padding_idx)
@@ -260,19 +270,19 @@ class LSTM(torch.nn.Module):
 
         return mi_loss
 
-    def train_lm(self, data, print_every=10, num_epochs=1000, batch_size=None, beta=.10, **kwds):
+    def train_lm(self, data, print_every=10, num_epochs=1000, batch_size=None, beta=.05, **kwds):
         if batch_size is None:
             batch_size = len(data)
-        opt = torch.optim.Adam(params=self.parameters(), **kwds)
+        opt = torch.optim.Adam(lr = .01, params=self.parameters(), **kwds)
         for i in range(num_epochs):
             opt.zero_grad()
             batch = random.sample(data, batch_size)  # shape B x T
             padded_batch = pad_sequences(batch)
             hidden_seq, c_seq, h_stats, c_stats = self.encode(padded_batch)  # shape B x (T+1) x H
-            y_hat = self.decode(hidden_seq)  # shape B x (T+1) x V
-            y = torch.roll(padded_batch, -1, -1)  # shape B x T
-            hib_loss = self.mi_loss(h_stats, y)
-            ce_loss = self.lm_loss(y, y_hat)
+            y_hat = self.decode(hidden_seq)  # shape B x (T+1) x V ???
+            #y = torch.roll(padded_batch, -1, -1)  # shape B x T
+            hib_loss = self.mi_loss(h_stats, padded_batch)
+            ce_loss = self.lm_loss(padded_batch, y_hat)
             loss = beta * hib_loss + ce_loss
             loss.backward()
             opt.step()
@@ -320,8 +330,8 @@ def example(**kwds):
         [6, 6, 6, 6, 6, 6, EOS_IDX],
     ]
     vocab_size = len(data) + 2
-    lstm = LSTM(vocab_size, vocab_size, 2, 10)
-    lstm.train_lm(data, **kwds)
+    lstm = LSTM(vocab_size, vocab_size, 2, 10, "h")
+    lstm.train_lm(data, num_epochs = 2000, **kwds)
     return lstm
 
 
@@ -378,15 +388,15 @@ def read_unimorph(filename, field=1):
 #
 
 
-def train_unimorph_lm(lang, hidden_size=100, num_layers=2, batch_size=5, num_epochs=2000, print_every=200,
+def train_unimorph_lm(lang, hidden_size=100, num_layers=2, batch_size = 50, num_epochs=20000, print_every=200,
                       num_samples=5, **kwds):
     data, vocab = list(format_sequences(read_unimorph("%s" % lang)))
     print("Loaded data for %s..." % lang, file=sys.stderr)
     vocab_size = len(vocab)
     print("Vocab size: %d" % vocab_size, file=sys.stderr)
-    lstm = LSTM(vocab_size, vocab_size, num_layers, hidden_size, "h")
+    lstm = LSTM(vocab_size, 20, num_layers, hidden_size, noise = "h")
     print(lstm, file=sys.stderr)
-    lstm.train_lm(data, batch_size=batch_size, num_epochs=num_epochs, print_every=print_every, beta=-.000001, **kwds)
+    lstm.train_lm(data, num_epochs=num_epochs, batch_size=batch_size, print_every=print_every, beta=0, **kwds)
     print("Generating %d samples..." % num_samples, file=sys.stderr)
     for _ in range(num_samples):
         symbols = list(lstm.generate())[:-1]
