@@ -4,7 +4,7 @@ from enum import IntEnum
 import sys
 import math
 import itertools
-
+import keyboard
 import numpy as np
 import random
 
@@ -16,6 +16,7 @@ EOS = '<!EOS!>'
 
 PADDING_IDX = 0
 EOS_IDX = 1
+INTERRUPT_KEY = "esc"
 
 flat = itertools.chain.from_iterable
 
@@ -27,22 +28,21 @@ class Dim(IntEnum):
 
 
 class GaussianLSTMCore(nn.Module):
-    def __init__(self, input_sz: int, hidden_sz: int, noise: str) \
+    def __init__(self, input_sz: int, hidden_sz: int) \
             :
         super(GaussianLSTMCore, self).__init__()
         self.input_sz = input_sz
         self.hidden_size = hidden_sz
         self.weight_ih = nn.Parameter(torch.Tensor(input_sz, hidden_sz * 4))
         self.weight_hh = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 4))
-        self.noise = noise
 
-        if noise == ("c" or "both"):
-            self.c_reparameterize = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 2))
-        if noise == ("h" or "both"):
-            self.h_reparameterize = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 2))
+        # if noise == ("c" or "both"):
+        #     self.c_reparameterize = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 2))
+        # if noise == ("h" or "both"):
+        #     self.h_reparameterize = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 2))
 
         self.bias = nn.Parameter(torch.Tensor(hidden_sz * 4))
-        self.init_weights()
+        # self.init_weights()
 
     def init_weights(self):
         for p in self.parameters():
@@ -50,13 +50,13 @@ class GaussianLSTMCore(nn.Module):
                 nn.init.xavier_uniform_(p.data)
             else:
                 nn.init.zeros_(p.data)
-        if hasattr(self,"h_reparameterize"):
-            scaling = torch.cat([torch.ones(self.hidden_size, self.hidden_size), torch.ones(self.hidden_size, self.hidden_size) * .000000001], dim=1)
-            self.h_reparameterize = torch.nn.Parameter(self.h_reparameterize * scaling)
-
-        if hasattr(self,"c_reparameterize"):
-            scaling = torch.cat([torch.ones(self.hidden_size, self.hidden_size), torch.ones(self.hidden_size, self.hidden_size) * .000000001], dim=1)
-            self.c_reparameterize = torch.nn.Parameter(self.c_reparameterize * scaling)
+        # if hasattr(self,"h_reparameterize"):
+        #     scaling = torch.cat([torch.ones(self.hidden_size, self.hidden_size), torch.ones(self.hidden_size, self.hidden_size) * .000000001], dim=1)
+        #     self.h_reparameterize = torch.nn.Parameter(self.h_reparameterize * scaling)
+        #
+        # if hasattr(self,"c_reparameterize"):
+        #     scaling = torch.cat([torch.ones(self.hidden_size, self.hidden_size), torch.ones(self.hidden_size, self.hidden_size) * .000000001], dim=1)
+        #     self.c_reparameterize = torch.nn.Parameter(self.c_reparameterize * scaling)
 
     def forward(self, x: torch.Tensor,
                 init_states=None):
@@ -147,6 +147,255 @@ class GaussianLSTMCore(nn.Module):
         return mu, std, mu + eps * std
 
 
+class h_GLSTMCore(GaussianLSTMCore):
+    def __init__(self, input_sz: int, hidden_sz: int):
+        super(h_GLSTMCore, self).__init__(input_sz, hidden_sz)
+        self.h_reparameterize = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 2))
+        self.init_weights()
+
+    def init_weights(self):
+        for p in self.parameters():
+            if p.data.ndimension() >= 2:
+                nn.init.xavier_uniform_(p.data)
+            else:
+                nn.init.zeros_(p.data)
+        scaling = torch.cat([torch.ones(self.hidden_size, self.hidden_size),
+                             torch.ones(self.hidden_size, self.hidden_size) * .000000001], dim=1)
+        self.h_reparameterize = torch.nn.Parameter(self.h_reparameterize * scaling)
+
+    def forward(self, x: torch.Tensor,
+                init_states=None):
+        """Assumes x is of shape (batch, sequence, feature)"""
+        bs, seq_sz, _ = x.size()
+        h_stats = []
+        if init_states is None:
+            h_t, c_t = (torch.zeros(self.hidden_size).to(x.device),
+                        torch.zeros(self.hidden_size).to(x.device))
+        else:
+            h_t, c_t = init_states
+
+        hidden_seq = []
+        c_seq = []
+
+        HS = self.hidden_size
+        for t in range(seq_sz):
+            x_t = x[:, t, :]
+            # batch the computations into a single matrix multiplication
+            gates = x_t @ self.weight_ih + h_t @ self.weight_hh + self.bias
+            i_t, f_t, g_t, o_t = (
+                torch.sigmoid(gates[:, :HS]),  # input
+                torch.sigmoid(gates[:, HS:HS * 2]),  # forget
+                torch.tanh(gates[:, HS * 2:HS * 3]),
+                torch.sigmoid(gates[:, HS * 3:]),  # output
+            )
+            pre_c_t = f_t * c_t + i_t * g_t
+            pre_h_t = o_t * torch.tanh(c_t)
+
+            # Produce parameters for Gaussian distribution of hidden_size dimensions
+            # sample from Gaussian distribution
+            # otherwise, pass pre_c_t/pre_h_t on as c_t/h_t itself
+            h_params = pre_h_t @ self.h_reparameterize
+            h_mu, h_std, h_t = self.sample(h_params)
+            h_stats.append(torch.cat([h_mu, h_std], dim=Dim.seq).unsqueeze(Dim.batch))
+            c_t = pre_c_t
+
+            # append returnable sequences
+            c_seq.append(c_t.unsqueeze(Dim.batch))
+            hidden_seq.append(h_t.unsqueeze(Dim.batch))
+
+            # c_stats.append(torch.cat([c_mu, c_std],dim=Dim.seq).unsqueeze(Dim.batch))
+            # h_stats.append(torch.cat([h_mu, h_std],dim=Dim.seq).unsqueeze(Dim.batch))
+
+        hidden_seq = torch.cat(hidden_seq, dim=Dim.batch)
+        c_seq = torch.cat(c_seq, dim=Dim.batch)
+
+        # Improvable later, but this section transforms and splits the stats tensors if relevant
+        # Tensor shape B x T x H
+        h_stats = torch.cat(h_stats, dim=Dim.batch)
+        h_stats = h_stats.transpose(Dim.batch, Dim.seq).contiguous()
+        h_stds = h_stats[:, :, self.hidden_size:].contiguous()
+        h_mus = h_stats[:, :, :self.hidden_size].contiguous()
+        c_mus = None
+        c_stds = None
+
+        # reshape from shape (sequence, batch, feature) to (batch, sequence, feature)
+        hidden_seq = hidden_seq.transpose(Dim.batch, Dim.seq).contiguous()
+        c_seq = c_seq.transpose(Dim.batch, Dim.seq).contiguous()
+        # h_stats = h_stats.transpose(Dim.batch, Dim.seq).contiguous()
+        # c_stats = c_stats.transpose(Dim.batch, Dim.seq).contiguous()
+        return hidden_seq, c_seq, (h_mus, h_stds), (c_mus, c_stds), (h_t, c_t)
+
+
+class c_GLSTMCore(GaussianLSTMCore):
+
+    def __init__(self, input_sz: int, hidden_sz: int):
+        super(c_GLSTMCore, self).__init__(input_sz, hidden_sz)
+        self.c_reparameterize = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 2))
+        self.init_weights()
+
+    def init_weights(self):
+        for p in self.parameters():
+            if p.data.ndimension() >= 2:
+                nn.init.xavier_uniform_(p.data)
+            else:
+                nn.init.zeros_(p.data)
+        scaling = torch.cat([torch.ones(self.hidden_size, self.hidden_size),
+                             torch.ones(self.hidden_size, self.hidden_size) * .000000001], dim=1)
+        self.c_reparameterize = torch.nn.Parameter(self.c_reparameterize * scaling)
+
+    def forward(self, x: torch.Tensor,
+                init_states=None):
+        """Assumes x is of shape (batch, sequence, feature)"""
+        bs, seq_sz, _ = x.size()
+        c_stats = []
+        if init_states is None:
+            h_t, c_t = (torch.zeros(self.hidden_size).to(x.device),
+                        torch.zeros(self.hidden_size).to(x.device))
+        else:
+            h_t, c_t = init_states
+
+        hidden_seq = []
+        c_seq = []
+
+        HS = self.hidden_size
+        for t in range(seq_sz):
+            x_t = x[:, t, :]
+            # batch the computations into a single matrix multiplication
+            gates = x_t @ self.weight_ih + h_t @ self.weight_hh + self.bias
+            i_t, f_t, g_t, o_t = (
+                torch.sigmoid(gates[:, :HS]),  # input
+                torch.sigmoid(gates[:, HS:HS * 2]),  # forget
+                torch.tanh(gates[:, HS * 2:HS * 3]),
+                torch.sigmoid(gates[:, HS * 3:]),  # output
+            )
+            pre_c_t = f_t * c_t + i_t * g_t
+            pre_h_t = o_t * torch.tanh(c_t)
+
+            # Produce parameters for Gaussian distribution of hidden_size dimensions
+            # sample from Gaussian distribution
+            # otherwise, pass pre_c_t/pre_h_t on as c_t/h_t itself
+            c_params = pre_c_t @ self.c_reparameterize
+            c_mu, c_std, c_t = self.sample(c_params)
+            c_stats.append(torch.cat([c_mu, c_std], dim=Dim.seq).unsqueeze(Dim.batch))
+            h_t = pre_h_t
+
+            # append returnable sequences
+            c_seq.append(c_t.unsqueeze(Dim.batch))
+            hidden_seq.append(h_t.unsqueeze(Dim.batch))
+
+            # c_stats.append(torch.cat([c_mu, c_std],dim=Dim.seq).unsqueeze(Dim.batch))
+            # h_stats.append(torch.cat([h_mu, h_std],dim=Dim.seq).unsqueeze(Dim.batch))
+
+        hidden_seq = torch.cat(hidden_seq, dim=Dim.batch)
+        c_seq = torch.cat(c_seq, dim=Dim.batch)
+
+        # Improvable later, but this section transforms and splits the stats tensors if relevant
+        # Tensor shape B x T x H
+        c_stats = torch.cat(c_stats, dim=Dim.batch)
+        c_stats = c_stats.transpose(Dim.batch, Dim.seq).contiguous()
+        c_stds = c_stats[:, :, self.hidden_size:].contiguous()
+        c_mus = c_stats[:, :, :self.hidden_size].contiguous()
+        h_mus = None
+        h_stds = None
+
+        # reshape from shape (sequence, batch, feature) to (batch, sequence, feature)
+        hidden_seq = hidden_seq.transpose(Dim.batch, Dim.seq).contiguous()
+        c_seq = c_seq.transpose(Dim.batch, Dim.seq).contiguous()
+        # h_stats = h_stats.transpose(Dim.batch, Dim.seq).contiguous()
+        # c_stats = c_stats.transpose(Dim.batch, Dim.seq).contiguous()
+        return hidden_seq, c_seq, (h_mus, h_stds), (c_mus, c_stds), (h_t, c_t)
+
+
+class b_GLSTMCore(GaussianLSTMCore):
+
+    def __init__(self, input_sz: int, hidden_sz: int):
+        super(b_GLSTMCore, self).__init__(input_sz, hidden_sz)
+        self.c_reparameterize = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 2))
+        self.h_reparameterize = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 2))
+        self.init_weights()
+
+    def init_weights(self):
+        for p in self.parameters():
+            if p.data.ndimension() >= 2:
+                nn.init.xavier_uniform_(p.data)
+            else:
+                nn.init.zeros_(p.data)
+        scaling = torch.cat([torch.ones(self.hidden_size, self.hidden_size),
+                             torch.ones(self.hidden_size, self.hidden_size) * .000000001], dim=1)
+        self.c_reparameterize = torch.nn.Parameter(self.c_reparameterize * scaling)
+        self.h_reparameterize = torch.nn.Parameter(self.h_reparameterize * scaling)
+
+    def forward(self, x: torch.Tensor,
+                init_states=None):
+        """Assumes x is of shape (batch, sequence, feature)"""
+        bs, seq_sz, _ = x.size()
+        c_stats = []
+        h_stats = []
+        if init_states is None:
+            h_t, c_t = (torch.zeros(self.hidden_size).to(x.device),
+                        torch.zeros(self.hidden_size).to(x.device))
+        else:
+            h_t, c_t = init_states
+
+        hidden_seq = []
+        c_seq = []
+
+        HS = self.hidden_size
+        for t in range(seq_sz):
+            x_t = x[:, t, :]
+            # batch the computations into a single matrix multiplication
+            gates = x_t @ self.weight_ih + h_t @ self.weight_hh + self.bias
+            i_t, f_t, g_t, o_t = (
+                torch.sigmoid(gates[:, :HS]),  # input
+                torch.sigmoid(gates[:, HS:HS * 2]),  # forget
+                torch.tanh(gates[:, HS * 2:HS * 3]),
+                torch.sigmoid(gates[:, HS * 3:]),  # output
+            )
+            pre_c_t = f_t * c_t + i_t * g_t
+            pre_h_t = o_t * torch.tanh(c_t)
+
+            # Produce parameters for Gaussian distribution of hidden_size dimensions
+            # sample from Gaussian distribution
+            # otherwise, pass pre_c_t/pre_h_t on as c_t/h_t itself
+            h_params = pre_h_t @ self.h_reparameterize
+            h_mu, h_std, h_t = self.sample(h_params)
+            h_stats.append(torch.cat([h_mu, h_std], dim=Dim.seq).unsqueeze(Dim.batch))
+
+            c_params = pre_c_t @ self.c_reparameterize
+            c_mu, c_std, c_t = self.sample(c_params)
+            c_stats.append(torch.cat([c_mu, c_std], dim=Dim.seq).unsqueeze(Dim.batch))
+
+            # append returnable sequences
+            c_seq.append(c_t.unsqueeze(Dim.batch))
+            hidden_seq.append(h_t.unsqueeze(Dim.batch))
+
+            # c_stats.append(torch.cat([c_mu, c_std],dim=Dim.seq).unsqueeze(Dim.batch))
+            # h_stats.append(torch.cat([h_mu, h_std],dim=Dim.seq).unsqueeze(Dim.batch))
+
+        hidden_seq = torch.cat(hidden_seq, dim=Dim.batch)
+        c_seq = torch.cat(c_seq, dim=Dim.batch)
+
+        # Improvable later, but this section transforms and splits the stats tensors if relevant
+        # Tensor shape B x T x H
+
+        h_stats = torch.cat(h_stats, dim=Dim.batch)
+        h_stats = h_stats.transpose(Dim.batch, Dim.seq).contiguous()
+        h_stds = h_stats[:, :, self.hidden_size:].contiguous()
+        h_mus = h_stats[:, :, :self.hidden_size].contiguous()
+
+        c_stats = torch.cat(c_stats, dim=Dim.batch)
+        c_stats = c_stats.transpose(Dim.batch, Dim.seq).contiguous()
+        c_stds = c_stats[:, :, self.hidden_size:].contiguous()
+        c_mus = c_stats[:, :, :self.hidden_size].contiguous()
+
+        # reshape from shape (sequence, batch, feature) to (batch, sequence, feature)
+        hidden_seq = hidden_seq.transpose(Dim.batch, Dim.seq).contiguous()
+        c_seq = c_seq.transpose(Dim.batch, Dim.seq).contiguous()
+        # h_stats = h_stats.transpose(Dim.batch, Dim.seq).contiguous()
+        # c_stats = c_stats.transpose(Dim.batch, Dim.seq).contiguous()
+        return hidden_seq, c_seq, (h_mus, h_stds), (c_mus, c_stds), (h_t, c_t)
+
+
 class LSTM(torch.nn.Module):
     def __init__(self, vocab_size, embedding_dim, num_layers, hidden_size, noise, padding_idx=PADDING_IDX,
                  eos_idx=EOS_IDX):
@@ -169,28 +418,25 @@ class LSTM(torch.nn.Module):
             padding_idx=self.padding_idx
         )
 
-
         # For the creation of multi-layer LSTMs
-        g = [GaussianLSTMCore(self.embedding_dim, self.hidden_size, self.noise)]
-        g.extend([GaussianLSTMCore(self.hidden_size, self.hidden_size, self.noise) for _ in range(1, self.num_layers)])
+        if self.noise == "h":
+            g = [h_GLSTMCore(self.embedding_dim, self.hidden_size)]
+            g.extend(
+                [h_GLSTMCore(self.hidden_size, self.hidden_size) for _ in range(1, self.num_layers)])
+        if self.noise == "c":
+            g = [c_GLSTMCore(self.embedding_dim, self.hidden_size)]
+            g.extend(
+                [c_GLSTMCore(self.hidden_size, self.hidden_size) for _ in range(1, self.num_layers)])
+        if self.noise == "both":
+            g = [b_GLSTMCore(self.embedding_dim, self.hidden_size)]
+            g.extend(
+                [b_GLSTMCore(self.hidden_size, self.hidden_size) for _ in range(1, self.num_layers)])
+
         self.gauss_lstm = nn.ModuleList(g)
 
-        # for i in range(self.num_layers):
-        #     g = GaussianLSTMCore(self.embedding_dim,self.hidden_size,"h")
-        #     print(type(g))
-        #     self.gauss_lstm.append(g)
-
-        # self.gauss_lstm = GaussianLSTMCore(
-        #     input_sz=self.embedding_dim,
-        #     hidden_sz=self.hidden_size,
-        #     noise="h"
-        #     #,
-        #     #batch_first=True
-        # )
-
         self.initial_state = (
-            torch.autograd.Variable(torch.randn(self.num_layers, self.hidden_size), requires_grad=True),
-            torch.autograd.Variable(torch.randn(self.num_layers, self.hidden_size), requires_grad=True)
+            nn.Parameter(torch.randn(self.num_layers, self.hidden_size, requires_grad=True)),
+            nn.Parameter(torch.randn(self.num_layers, self.hidden_size, requires_grad=True))
         )
 
         self.decoder = torch.nn.Linear(self.hidden_size, self.vocab_size)
@@ -219,11 +465,11 @@ class LSTM(torch.nn.Module):
 
         # If noise flag "h"/"c", transforms them, otherwise don't touch because it's a NoneType
 
-        if self.noise == ("c" or "both"):
+        if self.noise == "c" or self.noise == "both":
             c_mus = torch.cat(c_mus, Dim.feature)
             c_stds = torch.cat(c_stds, Dim.feature)
 
-        if self.noise == ("h" or "both"):
+        if self.noise == "h" or self.noise == "both":
             h_mus = torch.cat(h_mus, Dim.feature)
             h_stds = torch.cat(h_stds, Dim.feature)
 
@@ -259,36 +505,42 @@ class LSTM(torch.nn.Module):
 
     def mi_loss(self, stats, Y):
         std = stats[1]  # stats[:,:,self.hidden_size:].contiguous()
-        mu = stats[0]  #[:, :, :self.hidden_size].contiguous()
+        mu = stats[0]  # [:, :, :self.hidden_size].contiguous()
         Y_flat = Y.view(-1)
         mask = (Y_flat == self.padding_idx)
 
-        std_flat = std.contiguous().view(-1, self.hidden_size * self.num_layers)[mask, :] # B*TxH, remove padded entries
-        mu_flat = mu.contiguous().view(-1, self.hidden_size * self.num_layers)[mask, :] # B*TxH, ditto
+        std_flat = std.contiguous().view(-1, self.hidden_size * self.num_layers)[mask, :]  # B*TxH remove padded entries
+        mu_flat = mu.contiguous().view(-1, self.hidden_size * self.num_layers)[mask, :]  # B*TxH, ditto
 
         mi_loss = -(1 / 2) * (1 + 2 * std_flat.log() - mu_flat ** 2 - std_flat ** 2).mean()
 
         return mi_loss
 
-    def train_lm(self, data, print_every=10, num_epochs=1000, batch_size=None, beta=.05, **kwds):
+    def train_lm(self, data, print_every=10, num_epochs=1000, batch_size=None, beta_start=0, beta_end=.1, **kwds):
         if batch_size is None:
             batch_size = len(data)
-        opt = torch.optim.Adam(lr = .01, params=self.parameters(), **kwds)
-        for i in range(num_epochs):
-            opt.zero_grad()
-            batch = random.sample(data, batch_size)  # shape B x T
-            padded_batch = pad_sequences(batch)
-            hidden_seq, c_seq, h_stats, c_stats = self.encode(padded_batch)  # shape B x (T+1) x H
-            y_hat = self.decode(hidden_seq)  # shape B x (T+1) x V ???
-            #y = torch.roll(padded_batch, -1, -1)  # shape B x T
-            hib_loss = self.mi_loss(h_stats, padded_batch)
-            ce_loss = self.lm_loss(padded_batch, y_hat)
-            loss = beta * hib_loss + ce_loss
-            loss.backward()
-            opt.step()
-            if i % print_every == 0:
-                print("epoch %d, loss = %s, mutual information = %s" % (
-                i, str(loss.item() / LOG2), str(hib_loss.item() / LOG2)), file=sys.stderr)
+        opt = torch.optim.Adam(lr=.01, params=self.parameters(), **kwds)
+        alpha = annealing(beta_start, beta_end, num_epochs)
+        try:
+            for i in range(num_epochs):
+                opt.zero_grad()
+                batch = random.sample(data, batch_size)  # shape B x T
+                padded_batch = pad_sequences(batch)
+                hidden_seq, c_seq, h_stats, c_stats = self.encode(padded_batch)  # shape B x (T+1) x H
+                y_hat = self.decode(hidden_seq)  # shape B x (T+1) x V ???
+                # y = torch.roll(padded_batch, -1, -1)  # shape B x T
+                hib_loss = self.mi_loss(h_stats, padded_batch)
+                ce_loss = self.lm_loss(padded_batch, y_hat)
+                loss = next(alpha) * hib_loss + ce_loss
+                loss.backward()
+                opt.step()
+                if i % print_every == 0:
+                    print("epoch %d, loss = %s, cross entropy = %s, mutual information = %s" % (
+                        i, str(loss.item() / LOG2), str(ce_loss.item() / LOG2), str(hib_loss.item() / LOG2)), file=sys.stderr)
+        except KeyboardInterrupt:
+            print("Training interrupted.")
+            pass
+
 
     def distro_after(self, sequence):
         sequence = list(sequence) + [PADDING_IDX]
@@ -331,7 +583,7 @@ def example(**kwds):
     ]
     vocab_size = len(data) + 2
     lstm = LSTM(vocab_size, vocab_size, 2, 10, "h")
-    lstm.train_lm(data, num_epochs = 2000, **kwds)
+    lstm.train_lm(data, num_epochs=2000, **kwds)
     return lstm
 
 
@@ -388,20 +640,33 @@ def read_unimorph(filename, field=1):
 #
 
 
-def train_unimorph_lm(lang, hidden_size=100, num_layers=2, batch_size = 50, num_epochs=20000, print_every=200,
-                      num_samples=5, **kwds):
+def train_unimorph_lm(lang, hidden_size=100, num_layers=2, batch_size=2048, num_epochs=400, print_every=5,
+                      num_samples=5, noise = "h", **kwds):
     data, vocab = list(format_sequences(read_unimorph("%s" % lang)))
     print("Loaded data for %s..." % lang, file=sys.stderr)
     vocab_size = len(vocab)
     print("Vocab size: %d" % vocab_size, file=sys.stderr)
-    lstm = LSTM(vocab_size, 20, num_layers, hidden_size, noise = "h")
+    lstm = LSTM(vocab_size, 20, num_layers, hidden_size, noise=noise)
     print(lstm, file=sys.stderr)
-    lstm.train_lm(data, num_epochs=num_epochs, batch_size=batch_size, print_every=print_every, beta=0, **kwds)
+    try:
+        lstm.train_lm(data, num_epochs=num_epochs, batch_size=batch_size, print_every=print_every, beta_start=0,
+                        beta_end=.1, **kwds)
+    except KeyboardInterrupt:
+        print("Interrupted")
+
     print("Generating %d samples..." % num_samples, file=sys.stderr)
     for _ in range(num_samples):
         symbols = list(lstm.generate())[:-1]
         print("".join(map(vocab.__getitem__, symbols)), file=sys.stderr)
     return lstm, vocab
+
+
+def annealing(start, target, epochs):
+    step_size = (target - start)/(epochs+1)
+    current = start
+    for i in range(epochs):
+        current = current + step_size
+        yield(current)
 
 
 if __name__ == '__main__':
