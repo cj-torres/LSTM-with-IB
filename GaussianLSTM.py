@@ -4,7 +4,7 @@ from enum import IntEnum
 import sys
 import math
 import itertools
-import keyboard
+# import keyboard
 import numpy as np
 import random
 
@@ -239,7 +239,7 @@ class c_GLSTMCore(GaussianLSTMCore):
                 nn.init.xavier_uniform_(p.data)
             else:
                 nn.init.zeros_(p.data)
-        scaling = torch.cat([torch.ones(self.hidden_size, self.hidden_size),
+        scaling = torch.cat([torch.zeroes(self.hidden_size, self.hidden_size),
                              torch.ones(self.hidden_size, self.hidden_size) * .000000001], dim=1)
         self.c_reparameterize = torch.nn.Parameter(self.c_reparameterize * scaling)
 
@@ -506,21 +506,30 @@ class LSTM(torch.nn.Module):
     def mi_loss(self, stats, Y):
         std = stats[1]  # stats[:,:,self.hidden_size:].contiguous()
         mu = stats[0]  # [:, :, :self.hidden_size].contiguous()
-        Y_flat = Y.view(-1)
-        mask = (Y_flat == self.padding_idx)
+        # Y_flat = Y.view(-1)
+        mask = (Y != self.padding_idx)
+        n = mask.sum()
+        #print(n)
 
-        std_flat = std.contiguous().view(-1, self.hidden_size * self.num_layers)[mask, :]  # B*TxH remove padded entries
-        mu_flat = mu.contiguous().view(-1, self.hidden_size * self.num_layers)[mask, :]  # B*TxH, ditto
+        std_flat = std.contiguous()[mask,
+                   :]  # B*TxH remove padded entries #.view(-1, self.hidden_size * self.num_layers)
+        mu_flat = mu.contiguous()[mask, :]  # B*TxH, ditto
 
-        mi_loss = -(1 / 2) * (1 + 2 * std_flat.log() - mu_flat ** 2 - std_flat ** 2).mean()
+        #mi_loss = (-(1 / 2) * (1 + 2 * std_flat.log() - mu_flat ** 2 - std_flat ** 2)).mean()
+        mi_loss = (-(1/2)*(std_flat.log().sum(dim = 1) + self.hidden_size -
+                           (mu_flat**2).sum(dim = 1) - std_flat.sum(dim = 1))) #.sum()/n
 
-        return mi_loss
+        return mi_loss.sum()/n
+
+
+
+
 
     def train_lm(self, data, print_every=10, num_epochs=1000, batch_size=None, beta_start=0, beta_end=.1, **kwds):
         if batch_size is None:
             batch_size = len(data)
         opt = torch.optim.Adam(lr=.01, params=self.parameters(), **kwds)
-        alpha = annealing(beta_start, beta_end, num_epochs)
+        alpha = elbow_annealing(beta_start, beta_end, num_epochs,.75)
         try:
             for i in range(num_epochs):
                 opt.zero_grad()
@@ -536,11 +545,11 @@ class LSTM(torch.nn.Module):
                 opt.step()
                 if i % print_every == 0:
                     print("epoch %d, loss = %s, cross entropy = %s, mutual information = %s" % (
-                        i, str(loss.item() / LOG2), str(ce_loss.item() / LOG2), str(hib_loss.item() / LOG2)), file=sys.stderr)
+                        i, str(loss.item() / LOG2), str(ce_loss.item() / LOG2), str(hib_loss.item() / LOG2)),
+                          file=sys.stderr)
         except KeyboardInterrupt:
             print("Training interrupted.")
             pass
-
 
     def distro_after(self, sequence):
         sequence = list(sequence) + [PADDING_IDX]
@@ -640,8 +649,8 @@ def read_unimorph(filename, field=1):
 #
 
 
-def train_unimorph_lm(lang, hidden_size=100, num_layers=2, batch_size=2048, num_epochs=400, print_every=5,
-                      num_samples=5, noise = "h", **kwds):
+def train_unimorph_lm(lang, hidden_size=100, num_layers=2, batch_size=2048, num_epochs=2000, print_every=5,
+                      num_samples=25, noise="h", **kwds):
     data, vocab = list(format_sequences(read_unimorph("%s" % lang)))
     print("Loaded data for %s..." % lang, file=sys.stderr)
     vocab_size = len(vocab)
@@ -649,8 +658,8 @@ def train_unimorph_lm(lang, hidden_size=100, num_layers=2, batch_size=2048, num_
     lstm = LSTM(vocab_size, 20, num_layers, hidden_size, noise=noise)
     print(lstm, file=sys.stderr)
     try:
-        lstm.train_lm(data, num_epochs=num_epochs, batch_size=batch_size, print_every=print_every, beta_start=0,
-                        beta_end=.1, **kwds)
+        lstm.train_lm(data, num_epochs=num_epochs, batch_size=batch_size, print_every=print_every, beta_start=.001,
+                      beta_end=.1, **kwds)
     except KeyboardInterrupt:
         print("Interrupted")
 
@@ -662,12 +671,45 @@ def train_unimorph_lm(lang, hidden_size=100, num_layers=2, batch_size=2048, num_
 
 
 def annealing(start, target, epochs):
-    step_size = (target - start)/(epochs+1)
+    step_size = (target - start) / (epochs)
     current = start
     for i in range(epochs):
         current = current + step_size
-        yield(current)
+        yield current
 
+
+def elbow_annealing(start, target, epochs, elbow=.5):
+    from math import floor
+    step_size = (target - start) / (epochs * elbow)
+    current = start
+    for i in range(floor(epochs * elbow)):
+        current = current + step_size
+        yield current
+    while True:
+        yield target
+
+
+def double_elbow_annealing(start, target, epochs, elbow_1 = .25, elbow_2 = .75):
+    from math import floor
+    rise_steps = epochs * (elbow_2 - elbow_1)
+    step_size = (target - start) / rise_steps
+    current = start
+    for i in range(floor(epochs * elbow_1)):
+        yield start
+    for i in range(floor(rise_steps)):
+        current = current + step_size
+        yield current
+    while True:
+        yield target
+
+
+def kl_divergence(mu_1, std_1, mu_2, std_2):
+    std2_inv = std_2**(-1)
+    mu_diff = mu_2-mu_1
+    kld = (1/2)*((std_2.log().sum()-std_1.log().sum()) + std_1*std2_inv.sum() +
+          (std2_inv*(mu_diff**2)).sum())
+
+    return kld
 
 if __name__ == '__main__':
     train_unimorph_lm(*sys.argv[1:])
