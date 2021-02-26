@@ -4,9 +4,12 @@ from enum import IntEnum
 import sys
 import math
 import itertools
-# import keyboard
+import rfutils
+from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import random
+
+writer = SummaryWriter()
 
 INF = float('inf')
 LOG2 = math.log(2)
@@ -16,7 +19,7 @@ EOS = '<!EOS!>'
 
 PADDING_IDX = 0
 EOS_IDX = 1
-INTERRUPT_KEY = "esc"
+DEVICE = "cuda:0"
 
 flat = itertools.chain.from_iterable
 
@@ -28,21 +31,14 @@ class Dim(IntEnum):
 
 
 class GaussianLSTMCore(nn.Module):
-    def __init__(self, input_sz: int, hidden_sz: int) \
-            :
+    def __init__(self, input_sz: int, hidden_sz: int):
         super(GaussianLSTMCore, self).__init__()
         self.input_sz = input_sz
         self.hidden_size = hidden_sz
         self.weight_ih = nn.Parameter(torch.Tensor(input_sz, hidden_sz * 4))
         self.weight_hh = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 4))
 
-        # if noise == ("c" or "both"):
-        #     self.c_reparameterize = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 2))
-        # if noise == ("h" or "both"):
-        #     self.h_reparameterize = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 2))
-
         self.bias = nn.Parameter(torch.Tensor(hidden_sz * 4))
-        # self.init_weights()
 
     def init_weights(self):
         for p in self.parameters():
@@ -50,13 +46,6 @@ class GaussianLSTMCore(nn.Module):
                 nn.init.xavier_uniform_(p.data)
             else:
                 nn.init.zeros_(p.data)
-        # if hasattr(self,"h_reparameterize"):
-        #     scaling = torch.cat([torch.ones(self.hidden_size, self.hidden_size), torch.ones(self.hidden_size, self.hidden_size) * .000000001], dim=1)
-        #     self.h_reparameterize = torch.nn.Parameter(self.h_reparameterize * scaling)
-        #
-        # if hasattr(self,"c_reparameterize"):
-        #     scaling = torch.cat([torch.ones(self.hidden_size, self.hidden_size), torch.ones(self.hidden_size, self.hidden_size) * .000000001], dim=1)
-        #     self.c_reparameterize = torch.nn.Parameter(self.c_reparameterize * scaling)
 
     def forward(self, x: torch.Tensor,
                 init_states=None):
@@ -140,8 +129,8 @@ class GaussianLSTMCore(nn.Module):
         return hidden_seq, c_seq, (h_mus, h_stds), (c_mus, c_stds), (h_t, c_t)
 
     def sample(self, stats):
-        mu = stats[:, :self.hidden_size]
-        std = nn.functional.softplus(stats[:, self.hidden_size:], beta=1)
+        mu = stats[:, :self.hidden_size].clamp(min=1e-6,max=1e6)
+        std = nn.functional.softplus(stats[:, self.hidden_size:], beta=1).clamp(min=1e-6)
         eps = torch.autograd.Variable(std.data.new(std.size()).normal_())
         # output noisy sampling of size B x T x H
         return mu, std, mu + eps * std
@@ -160,7 +149,7 @@ class h_GLSTMCore(GaussianLSTMCore):
             else:
                 nn.init.zeros_(p.data)
         scaling = torch.cat([torch.ones(self.hidden_size, self.hidden_size),
-                             torch.ones(self.hidden_size, self.hidden_size) * .000000001], dim=1)
+                             torch.ones(self.hidden_size, self.hidden_size) * .00001], dim=1)
         self.h_reparameterize = torch.nn.Parameter(self.h_reparameterize * scaling)
 
     def forward(self, x: torch.Tensor,
@@ -178,8 +167,10 @@ class h_GLSTMCore(GaussianLSTMCore):
         c_seq = []
 
         HS = self.hidden_size
+
         for t in range(seq_sz):
             x_t = x[:, t, :]
+
             # batch the computations into a single matrix multiplication
             gates = x_t @ self.weight_ih + h_t @ self.weight_hh + self.bias
             i_t, f_t, g_t, o_t = (
@@ -239,8 +230,8 @@ class c_GLSTMCore(GaussianLSTMCore):
                 nn.init.xavier_uniform_(p.data)
             else:
                 nn.init.zeros_(p.data)
-        scaling = torch.cat([torch.zeroes(self.hidden_size, self.hidden_size),
-                             torch.ones(self.hidden_size, self.hidden_size) * .000000001], dim=1)
+        scaling = torch.cat([torch.ones(self.hidden_size, self.hidden_size),
+                             torch.ones(self.hidden_size, self.hidden_size) * .00001], dim=1)
         self.c_reparameterize = torch.nn.Parameter(self.c_reparameterize * scaling)
 
     def forward(self, x: torch.Tensor,
@@ -283,9 +274,6 @@ class c_GLSTMCore(GaussianLSTMCore):
             c_seq.append(c_t.unsqueeze(Dim.batch))
             hidden_seq.append(h_t.unsqueeze(Dim.batch))
 
-            # c_stats.append(torch.cat([c_mu, c_std],dim=Dim.seq).unsqueeze(Dim.batch))
-            # h_stats.append(torch.cat([h_mu, h_std],dim=Dim.seq).unsqueeze(Dim.batch))
-
         hidden_seq = torch.cat(hidden_seq, dim=Dim.batch)
         c_seq = torch.cat(c_seq, dim=Dim.batch)
 
@@ -301,8 +289,6 @@ class c_GLSTMCore(GaussianLSTMCore):
         # reshape from shape (sequence, batch, feature) to (batch, sequence, feature)
         hidden_seq = hidden_seq.transpose(Dim.batch, Dim.seq).contiguous()
         c_seq = c_seq.transpose(Dim.batch, Dim.seq).contiguous()
-        # h_stats = h_stats.transpose(Dim.batch, Dim.seq).contiguous()
-        # c_stats = c_stats.transpose(Dim.batch, Dim.seq).contiguous()
         return hidden_seq, c_seq, (h_mus, h_stds), (c_mus, c_stds), (h_t, c_t)
 
 
@@ -321,7 +307,7 @@ class b_GLSTMCore(GaussianLSTMCore):
             else:
                 nn.init.zeros_(p.data)
         scaling = torch.cat([torch.ones(self.hidden_size, self.hidden_size),
-                             torch.ones(self.hidden_size, self.hidden_size) * .000000001], dim=1)
+                             torch.ones(self.hidden_size, self.hidden_size) * .00001], dim=1)
         self.c_reparameterize = torch.nn.Parameter(self.c_reparameterize * scaling)
         self.h_reparameterize = torch.nn.Parameter(self.h_reparameterize * scaling)
 
@@ -369,8 +355,6 @@ class b_GLSTMCore(GaussianLSTMCore):
             c_seq.append(c_t.unsqueeze(Dim.batch))
             hidden_seq.append(h_t.unsqueeze(Dim.batch))
 
-            # c_stats.append(torch.cat([c_mu, c_std],dim=Dim.seq).unsqueeze(Dim.batch))
-            # h_stats.append(torch.cat([h_mu, h_std],dim=Dim.seq).unsqueeze(Dim.batch))
 
         hidden_seq = torch.cat(hidden_seq, dim=Dim.batch)
         c_seq = torch.cat(c_seq, dim=Dim.batch)
@@ -391,8 +375,6 @@ class b_GLSTMCore(GaussianLSTMCore):
         # reshape from shape (sequence, batch, feature) to (batch, sequence, feature)
         hidden_seq = hidden_seq.transpose(Dim.batch, Dim.seq).contiguous()
         c_seq = c_seq.transpose(Dim.batch, Dim.seq).contiguous()
-        # h_stats = h_stats.transpose(Dim.batch, Dim.seq).contiguous()
-        # c_stats = c_stats.transpose(Dim.batch, Dim.seq).contiguous()
         return hidden_seq, c_seq, (h_mus, h_stds), (c_mus, c_stds), (h_t, c_t)
 
 
@@ -434,10 +416,10 @@ class LSTM(torch.nn.Module):
 
         self.gauss_lstm = nn.ModuleList(g)
 
-        self.initial_state = (
-            nn.Parameter(torch.randn(self.num_layers, self.hidden_size, requires_grad=True)),
-            nn.Parameter(torch.randn(self.num_layers, self.hidden_size, requires_grad=True))
-        )
+        self.initial_state = torch.nn.Parameter(torch.stack(
+            [torch.randn(self.num_layers, self.hidden_size),
+             torch.randn(self.num_layers, self.hidden_size)]
+        ))
 
         self.decoder = torch.nn.Linear(self.hidden_size, self.vocab_size)
 
@@ -493,7 +475,7 @@ class LSTM(torch.nn.Module):
 
     def lm_loss(self, Y, Y_hat):
         # Y contains the target token indices. Shape B x T
-        # Y_hat contains distributions. Shape B x (T+1) x V ??? (Doesn't appear to be true)
+        # Y_hat contains distributions
         Y_flat = Y.view(-1)  # flatten to B*T
         Y_hat_flat = Y_hat.view(-1, self.vocab_size)  # flatten to B*T x V
         mask = (Y_flat == self.padding_idx)
@@ -506,50 +488,110 @@ class LSTM(torch.nn.Module):
     def mi_loss(self, stats, Y):
         std = stats[1]  # stats[:,:,self.hidden_size:].contiguous()
         mu = stats[0]  # [:, :, :self.hidden_size].contiguous()
-        # Y_flat = Y.view(-1)
         mask = (Y != self.padding_idx)
         n = mask.sum()
-        #print(n)
 
-        std_flat = std.contiguous()[mask,
-                   :]  # B*TxH remove padded entries #.view(-1, self.hidden_size * self.num_layers)
+        std_flat = std.contiguous()[mask, :]  # B*TxH remove padded entries
+
+        #std_flat = std_flat.clamp(min=1e-8)
         mu_flat = mu.contiguous()[mask, :]  # B*TxH, ditto
 
-        #mi_loss = (-(1 / 2) * (1 + 2 * std_flat.log() - mu_flat ** 2 - std_flat ** 2)).mean()
-        mi_loss = (-(1/2)*(std_flat.log().sum(dim = 1) + self.hidden_size -
-                           (mu_flat**2).sum(dim = 1) - std_flat.sum(dim = 1))) #.sum()/n
+        mi_loss = (-(1 / 2) * (std_flat.log().sum(dim=1) + self.hidden_size -
+                               (mu_flat ** 2).sum(dim=1) - std_flat.sum(dim=1)))
+        #print(mi_loss.isinf().any())
 
-        return mi_loss.sum()/n
+        return mi_loss.sum() / n
 
+    def process_data(self, data, batch_size, alpha, beta, validation=False):
+        m = sum([len(word) for word in data])
+        data_copy = data.copy()
+        random.shuffle(data_copy)
+        batches = split_list(data_copy, batch_size)
+        avg_loss = torch.FloatTensor([0]).to("cuda")
+        avg_hib_loss = torch.FloatTensor([0]).to("cuda")
+        avg_cib_loss = torch.FloatTensor([0]).to("cuda")
+        avg_ce_loss = torch.FloatTensor([0]).to("cuda")
+        #with torch.autograd.detect_anomaly():
+        with torch.set_grad_enabled(not validation):
+            for batch in batches:
+                self.opt.zero_grad()
+                n = sum([len(word) for word in batch])
+                w = n/m
+                padded_batch = pad_sequences(batch)
+                padded_batch = padded_batch.to("cuda")
+                hidden_seq, c_seq, h_stats, c_stats = self.encode(padded_batch)
+                y_hat = self.decode(hidden_seq)  # shape B x (T+1) x V ???
+                if self.noise == "h" or self.noise == "both":
+                    hib_loss = self.mi_loss(h_stats, padded_batch)
+                else: hib_loss = 0
+                if self.noise == "c" or self.noise == "both":
+                    cib_loss = self.mi_loss(c_stats, padded_batch)
+                else: cib_loss = 0
+                ce_loss = self.lm_loss(padded_batch, y_hat)
+                loss = alpha * hib_loss + beta * cib_loss + ce_loss
+                avg_loss += loss * w
+                avg_hib_loss += hib_loss * w
+                avg_cib_loss += cib_loss * w
+                avg_ce_loss += ce_loss * w
+                #yield (loss, avg_loss, avg_hib_loss, avg_cib_loss, avg_ce_loss)
 
+                if not validation:
+            #     print("loss " + str(loss.isnan().any()))
+                    loss.backward()
+                    self.opt.step()
 
+            del padded_batch
+        return loss, ce_loss, avg_loss, avg_ce_loss, avg_hib_loss, avg_cib_loss
 
-
-    def train_lm(self, data, print_every=10, num_epochs=1000, batch_size=None, beta_start=0, beta_end=.1, **kwds):
+    def train_lm(self, data, print_every=10, num_epochs=1000, batch_size=None, alpha_start = 0, alpha_end = .01,
+                 beta_start=0, beta_end=0, **kwds):
+        data_size = len(data)
+        hold_out_size = math.floor(data_size * .15)
+        random.shuffle(data)
+        testing_data = data[-hold_out_size:]
+        training_data = data[:-hold_out_size]
         if batch_size is None:
             batch_size = len(data)
-        opt = torch.optim.Adam(lr=.01, params=self.parameters(), **kwds)
-        alpha = elbow_annealing(beta_start, beta_end, num_epochs,.75)
+        self.opt = torch.optim.Adam(lr=.01, params=self.parameters(), **kwds)
+        alpha = elbow_annealing(alpha_start, alpha_end, num_epochs, .75)
+        beta = elbow_annealing(beta_start, beta_end, num_epochs, .75)
+        training_loss = []
+        testing_loss = []
+        self.to("cuda")
         try:
             for i in range(num_epochs):
-                opt.zero_grad()
-                batch = random.sample(data, batch_size)  # shape B x T
-                padded_batch = pad_sequences(batch)
-                hidden_seq, c_seq, h_stats, c_stats = self.encode(padded_batch)  # shape B x (T+1) x H
-                y_hat = self.decode(hidden_seq)  # shape B x (T+1) x V ???
-                # y = torch.roll(padded_batch, -1, -1)  # shape B x T
-                hib_loss = self.mi_loss(h_stats, padded_batch)
-                ce_loss = self.lm_loss(padded_batch, y_hat)
-                loss = next(alpha) * hib_loss + ce_loss
-                loss.backward()
-                opt.step()
+                a = next(alpha)
+                b = next(beta)
+                #opt.zero_grad()
+                loss, ce_loss, avg_loss, avg_ce_loss, avg_hib_loss, avg_cib_loss = self.process_data(training_data, batch_size, a, b)
+                    #(loss, avg_loss, avg_hib_loss, avg_cib_loss, avg_ce_loss) = batch
+                    #loss.backward()
+                    #opt.step()
+                    #opt.zero_grad()
+                #loss, avg_loss, avg_ce_loss, avg_hib_loss, avg_cib_loss = self.process_data(training_data, batch_size, a, b)
+                training_loss.append(avg_loss)
+                writer.add_scalar("Loss/train", loss.item()/LOG2, i)
+                writer.add_scalar("CE/train", ce_loss.item()/LOG2, i)
+
                 if i % print_every == 0:
-                    print("epoch %d, loss = %s, cross entropy = %s, mutual information = %s" % (
-                        i, str(loss.item() / LOG2), str(ce_loss.item() / LOG2), str(hib_loss.item() / LOG2)),
-                          file=sys.stderr)
+                    print(
+                        "epoch %d, loss = %s, cross entropy = %s, h mutual information = %s, c mutual information = %s" % (
+                            i, str(avg_loss.item() / LOG2), str(avg_ce_loss.item() / LOG2), str(avg_hib_loss.item() / LOG2),
+                            str(avg_cib_loss.item() / LOG2)), file=sys.stderr)
+                    #with torch.set_grad_enabled(False):
+                    loss, ce_loss, avg_loss, avg_ce_loss, avg_hib_loss, avg_cib_loss = self.process_data(testing_data, batch_size, a, b, validation=True)
+                            #(loss, avg_loss, avg_hib_loss, avg_cib_loss, avg_ce_loss) = batch #self.process_data(testing_data, batch_size, a, b)
+                    print("testing loss = %s, cross entropy = %s, h mutual information = %s, c mutual information = %s" % (
+                        str(avg_loss.item() / LOG2), str(avg_ce_loss.item() / LOG2), str(avg_hib_loss.item() / LOG2),
+                        str(avg_cib_loss.item() / LOG2)), file=sys.stderr)
+                    writer.add_scalar("Loss/test", avg_loss.item()/LOG2, i)
+                    writer.add_scalar("CE/test", avg_ce_loss.item()/LOG2, i)
+                    testing_loss.append(loss)
         except KeyboardInterrupt:
             print("Training interrupted.")
             pass
+
+        return (avg_hib_loss/avg_cib_loss)
 
     def distro_after(self, sequence):
         sequence = list(sequence) + [PADDING_IDX]
@@ -568,6 +610,24 @@ class LSTM(torch.nn.Module):
                 break
             else:
                 so_far.append(sampled)
+
+    def mi_read(self, word):
+        h_kl_seq = []
+        c_kl_seq = []
+        hidden_seq, c_seq, h_stats, c_stats = self.encode(pad_sequences([word]))
+        (h_mus, h_stds) = h_stats
+        (c_mus, c_stds) = c_stats
+        if self.noise == "h" or self.noise == "both":
+            for i, (a,b) in enumerate(rfutils.sliding(torch.squeeze(h_mus),2)):
+                kld = kl_divergence(a,torch.squeeze(h_stds)[i],b,torch.squeeze(h_stds)[i+1])
+                print(kld)
+                h_kl_seq.append(kld)
+        if self.noise == "h" or self.noise == "both":
+            for i, (a,b) in enumerate(rfutils.sliding(torch.squeeze(h_mus),2)):
+                kld = kl_divergence(a,torch.squeeze(c_stds)[i],b,torch.squeeze(h_stds)[i+1])
+                print(kld)
+                c_kl_seq.append(kld)
+        return h_kl_seq, c_kl_seq
 
 
 def pad_sequences(xs, padding_idx=PADDING_IDX):
@@ -597,6 +657,7 @@ def example(**kwds):
 
 
 class Indexer:
+
     def __init__(self, eos_idx=EOS_IDX, padding_idx=PADDING_IDX):
         self.counter = itertools.count()
         self.eos_idx = eos_idx
@@ -627,7 +688,7 @@ class Indexer:
 def format_sequences(xss):
     indexer = Indexer()
     result = list(map(indexer.format_sequence, xss))
-    return result, indexer.vocab
+    return result, indexer.vocab, indexer
 
 
 def read_unimorph(filename, field=1):
@@ -649,26 +710,45 @@ def read_unimorph(filename, field=1):
 #
 
 
-def train_unimorph_lm(lang, hidden_size=100, num_layers=2, batch_size=2048, num_epochs=2000, print_every=5,
-                      num_samples=25, noise="h", **kwds):
-    data, vocab = list(format_sequences(read_unimorph("%s" % lang)))
+def train_unimorph_lm(lang, hidden_size=100, num_layers=2, batch_size=2048, num_epochs=200, print_every=2,
+                      num_samples=25, noise="both", **kwds):
+    data, vocab, indexer = list(format_sequences(read_unimorph("%s" % lang)))
     print("Loaded data for %s..." % lang, file=sys.stderr)
     vocab_size = len(vocab)
     print("Vocab size: %d" % vocab_size, file=sys.stderr)
-    lstm = LSTM(vocab_size, 20, num_layers, hidden_size, noise=noise)
+    lstm = LSTM(vocab_size, 20, int(num_layers), int(hidden_size), noise=noise).to("cuda:0")
+    #lstm.double()
     print(lstm, file=sys.stderr)
-    try:
-        lstm.train_lm(data, num_epochs=num_epochs, batch_size=batch_size, print_every=print_every, beta_start=.001,
-                      beta_end=.1, **kwds)
-    except KeyboardInterrupt:
-        print("Interrupted")
-
+    lstm.train_lm(data, num_epochs=int(num_epochs), batch_size=int(batch_size), print_every=int(print_every),
+                  beta_start=0.0005, beta_end=0.0005, alpha_start=0.0005, alpha_end=0.0005, **kwds)
+    lstm.to("cpu")
     print("Generating %d samples..." % num_samples, file=sys.stderr)
     for _ in range(num_samples):
         symbols = list(lstm.generate())[:-1]
         print("".join(map(vocab.__getitem__, symbols)), file=sys.stderr)
+    #lstm.mi_read(indexer.format_sequence("bending"))
+
+    torch.save(lstm, "char_model.lstm")
     return lstm, vocab
 
+def train_many_both(lang, hidden_size=100, num_layers=2, batch_size=2048, num_epochs=200, print_every=2,
+                      num_samples=25, start_lambda = .0005, end_lambda = .005, step_size = .0001, **kwds):
+    data, vocab, indexer = list(format_sequences(read_unimorph("%s" % lang)))
+    print("Loaded data for %s..." % lang, file=sys.stderr)
+    vocab_size = len(vocab)
+    print("Vocab size: %d" % vocab_size, file=sys.stderr)
+    lam = start_lambda
+    ratios = []
+    while(lam <= end_lambda):
+        lstm = LSTM(vocab_size, 20, int(num_layers), int(hidden_size), noise="both").to("cuda:0")
+        r = lstm.train_lm(data, num_epochs=int(num_epochs), batch_size=int(batch_size), print_every=int(print_every),
+                      beta_start=lam, beta_end=lam, alpha_start=lam, alpha_end=lam, **kwds)
+        lstm.to("cpu")
+        torch.save(lstm, ("char_model_%s.lstm" % str(lam)))
+        print(r)
+        ratios.append(r)
+        lam += step_size
+    torch.save(torch.tensor(r),"ratios.pt")
 
 def annealing(start, target, epochs):
     step_size = (target - start) / (epochs)
@@ -689,7 +769,7 @@ def elbow_annealing(start, target, epochs, elbow=.5):
         yield target
 
 
-def double_elbow_annealing(start, target, epochs, elbow_1 = .25, elbow_2 = .75):
+def double_elbow_annealing(start, target, epochs, elbow_1=.25, elbow_2=.75):
     from math import floor
     rise_steps = epochs * (elbow_2 - elbow_1)
     step_size = (target - start) / rise_steps
@@ -704,12 +784,22 @@ def double_elbow_annealing(start, target, epochs, elbow_1 = .25, elbow_2 = .75):
 
 
 def kl_divergence(mu_1, std_1, mu_2, std_2):
-    std2_inv = std_2**(-1)
-    mu_diff = mu_2-mu_1
-    kld = (1/2)*((std_2.log().sum()-std_1.log().sum()) + std_1*std2_inv.sum() +
-          (std2_inv*(mu_diff**2)).sum())
-
+    std2_inv = std_2 ** (-1)
+    mu_diff = mu_2 - mu_1
+    kld = (1 / 2) * ((std_2.log().sum() - std_1.log().sum()) + (std_1 * std2_inv).sum() +
+                     (std2_inv * (mu_diff ** 2)).sum())
     return kld
+
+
+def split_list(data, length):
+    new_list = []
+    split_num = -(-len(data) // length) - 1
+    for i in range(split_num):
+        new_list.append(data[i * length:(i + 1) * length])
+    new_list.append(data[split_num * length:])
+
+    return new_list
+
 
 if __name__ == '__main__':
     train_unimorph_lm(*sys.argv[1:])
