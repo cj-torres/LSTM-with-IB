@@ -6,12 +6,12 @@ MODEL_DIR = "models"
 hidden_size = 30
 num_layers = 1
 embedding_dim = 30
-betas = [.005,.004,.003,.001]
+betas = [.001]
 candidate_va = [True,False]
 trials = [1,2,3,4,5,6,7,8]
 
 
-with open('va_models.csv', 'w', newline='') as model_file:
+with open('va_models_mi.csv', 'w', newline='') as model_file:
     model_writer = csv.writer(model_file)
     model_writer.writerow(["name","embedding_dim","annealer","loss","ce","hib","cib"])
 

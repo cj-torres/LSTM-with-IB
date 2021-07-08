@@ -26,16 +26,18 @@ class Dim(IntEnum):
     seq = 1
     feature = 2
 
+class Gaussian_Sampler(nn.Module):
 
-class GaussianLSTMCore(nn.Module):
-    def __init__(self, input_sz: int, hidden_sz: int):
-        super(GaussianLSTMCore, self).__init__()
-        self.input_sz = input_sz
-        self.hidden_size = hidden_sz
-        self.weight_ih = nn.Parameter(torch.Tensor(input_sz, hidden_sz * 4))
-        self.weight_hh = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 4))
+    """
+    Module to sample from multivariate Gaussian distributions.
+    Converts input into a sampled vector of the same size.
+    """
 
-        self.bias = nn.Parameter(torch.Tensor(hidden_sz * 4))
+    def __init__(self, input_size: int):
+        super(Gaussian_Sampler, self).__init__()
+        self.input_size = input_size
+        self.gauss_parameter_generator = nn.Parameter(torch.FloatTensor(self.input_size, self.input_size*2))
+        self.init_weights()
 
     def init_weights(self):
         for p in self.parameters():
@@ -44,99 +46,136 @@ class GaussianLSTMCore(nn.Module):
             else:
                 nn.init.zeros_(p.data)
 
-    def forward(self, x: torch.Tensor,
-                init_states=None):
-        """Assumes x is of shape (batch, sequence, feature)"""
-        bs, seq_sz, _ = x.size()
-        c_stats = []
-        h_stats = []
-        if init_states is None:
-            h_t, c_t = (torch.zeros(self.hidden_size).to(x.device),
-                        torch.zeros(self.hidden_size).to(x.device))
-        else:
-            h_t, c_t = init_states
-
-        hidden_seq = []
-        c_seq = []
-
-        HS = self.hidden_size
-        for t in range(seq_sz):
-            x_t = x[:, t, :]
-            # batch the computations into a single matrix multiplication
-            gates = x_t @ self.weight_ih + h_t @ self.weight_hh + self.bias
-            i_t, f_t, g_t, o_t = (
-                torch.sigmoid(gates[:, :HS]),  # input
-                torch.sigmoid(gates[:, HS:HS * 2]),  # forget
-                torch.tanh(gates[:, HS * 2:HS * 3]),
-                torch.sigmoid(gates[:, HS * 3:]),  # output
-            )
-            pre_c_t = f_t * c_t + i_t * g_t
-            pre_h_t = o_t * torch.tanh(c_t)
-
-            # Produce parameters for Gaussian distribution of hidden_size dimensions
-            # sample from Gaussian distribution
-            # otherwise, pass pre_c_t/pre_h_t on as c_t/h_t itself
-            if self.noise == ("h" or "both"):
-                h_params = pre_h_t @ self.h_reparameterize
-                h_mu, h_std, h_t = self.sample(h_params)
-                h_stats.append(torch.cat([h_mu, h_std], dim=Dim.seq).unsqueeze(Dim.batch))
-            else:
-                h_t = pre_h_t
-            if self.noise == ("c" or "both"):
-                c_params = pre_c_t @ self.c_reparameterize
-                c_mu, c_std, c_t = self.sample(c_params)
-                c_stats.append(torch.cat([c_mu, c_std], dim=Dim.seq).unsqueeze(Dim.batch))
-            else:
-                c_t = pre_c_t
-
-            # append returnable sequences
-            c_seq.append(c_t.unsqueeze(Dim.batch))
-            hidden_seq.append(h_t.unsqueeze(Dim.batch))
-
-            # c_stats.append(torch.cat([c_mu, c_std],dim=Dim.seq).unsqueeze(Dim.batch))
-            # h_stats.append(torch.cat([h_mu, h_std],dim=Dim.seq).unsqueeze(Dim.batch))
-
-        hidden_seq = torch.cat(hidden_seq, dim=Dim.batch)
-        c_seq = torch.cat(c_seq, dim=Dim.batch)
-
-        # Improvable later, but this section transforms and splits the stats tensors if relevant
-        # Tensor shape B x T x H
-        if self.noise == ("h" or "both"):
-            h_stats = torch.cat(h_stats, dim=Dim.batch)
-            h_stats = h_stats.transpose(Dim.batch, Dim.seq).contiguous()
-            h_stds = h_stats[:, :, self.hidden_size:].contiguous()
-            h_mus = h_stats[:, :, :self.hidden_size].contiguous()
-        else:
-            h_mus = None
-            h_stds = None
-        if self.noise == ("c" or "both"):
-            c_stats = torch.cat(c_stats, dim=Dim.batch)
-            c_stats = c_stats.transpose(Dim.batch, Dim.seq).contiguous()
-            c_stds = c_stats[:, :, self.hidden_size:].contiguous()
-            c_mus = c_stats[:, :, :self.hidden_size].contiguous()
-        else:
-            c_mus = None
-            c_stds = None
-
-        # reshape from shape (sequence, batch, feature) to (batch, sequence, feature)
-        hidden_seq = hidden_seq.transpose(Dim.batch, Dim.seq).contiguous()
-        c_seq = c_seq.transpose(Dim.batch, Dim.seq).contiguous()
-        # h_stats = h_stats.transpose(Dim.batch, Dim.seq).contiguous()
-        # c_stats = c_stats.transpose(Dim.batch, Dim.seq).contiguous()
-        return hidden_seq, c_seq, (h_mus, h_stds), (c_mus, c_stds), (h_t, c_t)
-
     def sample(self, stats):
-        mu = stats[:, :self.hidden_size].clamp(min=1e-6, max=1e6)
-        std = nn.functional.softplus(stats[:, self.hidden_size:], beta=1).clamp(min=1e-6)
+        mu = stats[:, :, :self.input_size].clamp(min=1e-6, max=1e6)
+        std = nn.functional.softplus(stats[:, :, self.input_size:], beta=1).clamp(min=1e-6)
         eps = torch.autograd.Variable(std.data.new(std.size()).normal_())
         # output noisy sampling of size B x T x H
         return mu, std, mu + eps * std
 
+    def forward(self, x: torch.Tensor):
+        # x is of size TxBxF
+        gauss_parameters = x @ self.gauss_parameter_generator
+        mu, std, sample = self.sample(gauss_parameters)
 
-class h_GLSTMCore(GaussianLSTMCore):
+        return (sample, mu, std)
+
+
+class Recursive_Gaussian_LSTM(nn.Module):
     def __init__(self, input_sz: int, hidden_sz: int):
-        super(h_GLSTMCore, self).__init__(input_sz, hidden_sz)
-        self.h_reparameterize = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 2))
+        super(Recursive_Gaussian_LSTM, self).__init__()
+        self.input_sz = input_sz
+        self.hidden_size = hidden_sz
+
+        self.lstm = torch.nn.LSTM(
+            input_size=self.input_sz,
+            hidden_size=self.hidden_size,
+            num_layers=1,
+            batch_first=True
+        )
+
+
+    def init_weights(self):
+        for p in self.parameters():
+            if p.data.ndimension() >= 2:
+                nn.init.xavier_uniform_(p.data)
+            else:
+                nn.init.zeros_(p.data)
+
+    # def forward(self, x: torch.Tensor,
+    #             init_states=None):
+    #     """Assumes x is of shape (batch, sequence, feature)"""
+    #     bs, seq_sz, _ = x.size()
+    #     h_distributions = []
+    #     c_distributions = []
+    #     if init_states is None:
+    #         h_t, c_t = (torch.zeros(self.hidden_size).to(x.device),
+    #                     torch.zeros(self.hidden_size).to(x.device))
+    #     else:
+    #         h_t, c_t = init_states
+    #
+    #     hidden_seq = []
+    #     c_seq = []
+    #
+    #     HS = self.hidden_size
+    #     for t in range(seq_sz):
+    #         x_t = x[:, t, :]
+    #         output, (out_h, out_c) = self.lstm(x_t, (h_t, c_t))
+    #         # batch the computations into a single matrix multiplication
+    #         gates = x_t @ self.weight_ih + h_t @ self.weight_hh + self.bias
+    #         i_t, f_t, g_t, o_t = (
+    #             torch.sigmoid(gates[:, :HS]),  # input
+    #             torch.sigmoid(gates[:, HS:HS * 2]),  # forget
+    #             torch.tanh(gates[:, HS * 2:HS * 3]),
+    #             torch.sigmoid(gates[:, HS * 3:]),  # output
+    #         )
+    #         pre_c_t = f_t * c_t + i_t * g_t
+    #         pre_h_t = o_t * torch.tanh(c_t)
+    #
+    #         # Produce parameters for Gaussian distribution of hidden_size dimensions
+    #         # sample from Gaussian distribution
+    #         # otherwise, pass pre_c_t/pre_h_t on as c_t/h_t itself
+    #         if self.noise == ("h" or "both"):
+    #             h_params = pre_h_t @ self.h_reparameterize
+    #             h_mu, h_std, h_t = self.sample(h_params)
+    #             h_stats.append(torch.cat([h_mu, h_std], dim=Dim.seq).unsqueeze(Dim.batch))
+    #         else:
+    #             h_t = pre_h_t
+    #         if self.noise == ("c" or "both"):
+    #             c_params = pre_c_t @ self.c_reparameterize
+    #             c_mu, c_std, c_t = self.sample(c_params)
+    #             c_stats.append(torch.cat([c_mu, c_std], dim=Dim.seq).unsqueeze(Dim.batch))
+    #         else:
+    #             c_t = pre_c_t
+    #
+    #         # append returnable sequences
+    #         c_seq.append(c_t.unsqueeze(Dim.batch))
+    #         hidden_seq.append(h_t.unsqueeze(Dim.batch))
+    #
+    #         # c_stats.append(torch.cat([c_mu, c_std],dim=Dim.seq).unsqueeze(Dim.batch))
+    #         # h_stats.append(torch.cat([h_mu, h_std],dim=Dim.seq).unsqueeze(Dim.batch))
+    #
+    #     hidden_seq = torch.cat(hidden_seq, dim=Dim.batch)
+    #     c_seq = torch.cat(c_seq, dim=Dim.batch)
+    #
+    #     # Improvable later, but this section transforms and splits the stats tensors if relevant
+    #     # Tensor shape B x T x H
+    #     if self.noise == ("h" or "both"):
+    #         h_stats = torch.cat(h_stats, dim=Dim.batch)
+    #         h_stats = h_stats.transpose(Dim.batch, Dim.seq).contiguous()
+    #         h_stds = h_stats[:, :, self.hidden_size:].contiguous()
+    #         h_mus = h_stats[:, :, :self.hidden_size].contiguous()
+    #     else:
+    #         h_mus = None
+    #         h_stds = None
+    #     if self.noise == ("c" or "both"):
+    #         c_stats = torch.cat(c_stats, dim=Dim.batch)
+    #         c_stats = c_stats.transpose(Dim.batch, Dim.seq).contiguous()
+    #         c_stds = c_stats[:, :, self.hidden_size:].contiguous()
+    #         c_mus = c_stats[:, :, :self.hidden_size].contiguous()
+    #     else:
+    #         c_mus = None
+    #         c_stds = None
+    #
+    #     # reshape from shape (sequence, batch, feature) to (batch, sequence, feature)
+    #     hidden_seq = hidden_seq.transpose(Dim.batch, Dim.seq).contiguous()
+    #     c_seq = c_seq.transpose(Dim.batch, Dim.seq).contiguous()
+    #     # h_stats = h_stats.transpose(Dim.batch, Dim.seq).contiguous()
+    #     # c_stats = c_stats.transpose(Dim.batch, Dim.seq).contiguous()
+    #     return hidden_seq, c_seq, (h_mus, h_stds), (c_mus, c_stds), (h_t, c_t)
+
+    # def sample(self, stats):
+    #     mu = stats[:, :self.hidden_size].clamp(min=1e-6, max=1e6)
+    #     std = nn.functional.softplus(stats[:, self.hidden_size:], beta=1).clamp(min=1e-6)
+    #     eps = torch.autograd.Variable(std.data.new(std.size()).normal_())
+    #     # output noisy sampling of size B x T x H
+    #     return mu, std, mu + eps * std
+
+
+class h_RGLSTM(Recursive_Gaussian_LSTM):
+    def __init__(self, input_sz: int, hidden_sz: int):
+        super(h_RGLSTM, self).__init__(input_sz, hidden_sz)
+        self.h_gauss_sampler = Gaussian_Sampler(hidden_sz)
         self.init_weights()
 
     def init_weights(self):
@@ -145,80 +184,55 @@ class h_GLSTMCore(GaussianLSTMCore):
                 nn.init.xavier_uniform_(p.data)
             else:
                 nn.init.zeros_(p.data)
-        scaling = torch.cat([torch.ones(self.hidden_size, self.hidden_size),
-                             torch.ones(self.hidden_size, self.hidden_size) * .00001], dim=1)
-        self.h_reparameterize = torch.nn.Parameter(self.h_reparameterize * scaling)
 
     def forward(self, x: torch.Tensor,
                 init_states=None):
         """Assumes x is of shape (batch, sequence, feature)"""
         bs, seq_sz, _ = x.size()
-        h_stats = []
+        h_mus = []
+        h_stds = []
         if init_states is None:
-            h_t, c_t = (torch.zeros(self.hidden_size).to(x.device),
-                        torch.zeros(self.hidden_size).to(x.device))
+            h_t, c_t = (torch.stack([torch.zeros(self.hidden_size).to(x.device)] * bs, dim=1),
+                        torch.stack([torch.zeros(self.hidden_size).to(x.device)] * bs, dim=1))
         else:
             h_t, c_t = init_states
 
         hidden_seq = []
-        c_seq = []
+        h_t = h_t.unsqueeze(dim=0)
+        c_t = c_t.unsqueeze(dim=0)
 
-        HS = self.hidden_size
+
+        h_t, h_mu, h_std = self.h_gauss_sampler(h_t)
+        h_mus.append(h_mu.squeeze(dim=0))
+        h_stds.append(h_std.squeeze(dim=0))
+        #c_seq = []
+
+        #HS = self.hidden_size
 
         for t in range(seq_sz):
             x_t = x[:, t, :]
+            output, (out_h, out_c) = self.lstm(x_t.unsqueeze(dim=1), (h_t, c_t))
+            c_t = out_c
+            h_t, h_mu, h_std = self.h_gauss_sampler(out_h)
+            h_mus.append(h_mu.squeeze(dim=0))
+            h_stds.append(h_std.squeeze(dim=0))
+            #h_distributions.append(torch.cat([h_mu, h_std], dim=Dim.seq).unsqueeze(Dim.batch))
+            hidden_seq.append(h_t)
 
-            # batch the computations into a single matrix multiplication
-            gates = x_t @ self.weight_ih + h_t @ self.weight_hh + self.bias
-            i_t, f_t, g_t, o_t = (
-                torch.sigmoid(gates[:, :HS]),  # input
-                torch.sigmoid(gates[:, HS:HS * 2]),  # forget
-                torch.tanh(gates[:, HS * 2:HS * 3]),
-                torch.sigmoid(gates[:, HS * 3:]),  # output
-            )
-            pre_c_t = f_t * c_t + i_t * g_t
-            pre_h_t = o_t * torch.tanh(c_t)
 
-            # Produce parameters for Gaussian distribution of hidden_size dimensions
-            # sample from Gaussian distribution
-            # otherwise, pass pre_c_t/pre_h_t on as c_t/h_t itself
-            h_params = pre_h_t @ self.h_reparameterize
-            h_mu, h_std, h_t = self.sample(h_params)
-            h_stats.append(torch.cat([h_mu, h_std], dim=Dim.seq).unsqueeze(Dim.batch))
-            c_t = pre_c_t
-
-            # append returnable sequences
-            c_seq.append(c_t.unsqueeze(Dim.batch))
-            hidden_seq.append(h_t.unsqueeze(Dim.batch))
-
-            # c_stats.append(torch.cat([c_mu, c_std],dim=Dim.seq).unsqueeze(Dim.batch))
-            # h_stats.append(torch.cat([h_mu, h_std],dim=Dim.seq).unsqueeze(Dim.batch))
-
-        hidden_seq = torch.cat(hidden_seq, dim=Dim.batch)
-        c_seq = torch.cat(c_seq, dim=Dim.batch)
-
-        # Improvable later, but this section transforms and splits the stats tensors if relevant
-        # Tensor shape B x T x H
-        h_stats = torch.cat(h_stats, dim=Dim.batch)
-        h_stats = h_stats.transpose(Dim.batch, Dim.seq).contiguous()
-        h_stds = h_stats[:, :, self.hidden_size:].contiguous()
-        h_mus = h_stats[:, :, :self.hidden_size].contiguous()
-        c_mus = None
-        c_stds = None
-
+        hidden_seq = torch.cat(hidden_seq, dim=Dim.batch).squeeze()
+        h_mus = torch.stack(h_mus).transpose(Dim.batch, Dim.seq).contiguous()
+        h_stds = torch.stack(h_stds).transpose(Dim.batch, Dim.seq).contiguous()
         # reshape from shape (sequence, batch, feature) to (batch, sequence, feature)
         hidden_seq = hidden_seq.transpose(Dim.batch, Dim.seq).contiguous()
-        c_seq = c_seq.transpose(Dim.batch, Dim.seq).contiguous()
-        # h_stats = h_stats.transpose(Dim.batch, Dim.seq).contiguous()
-        # c_stats = c_stats.transpose(Dim.batch, Dim.seq).contiguous()
-        return hidden_seq, c_seq, (h_mus, h_stds), (c_mus, c_stds), (h_t, c_t)
+        return hidden_seq, ((h_mus,h_stds), None), (h_t, c_t)
 
 
-class c_GLSTMCore(GaussianLSTMCore):
+class c_RGLSTM(Recursive_Gaussian_LSTM):
 
     def __init__(self, input_sz: int, hidden_sz: int):
-        super(c_GLSTMCore, self).__init__(input_sz, hidden_sz)
-        self.c_reparameterize = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 2))
+        super(c_RGLSTM, self).__init__(input_sz, hidden_sz)
+        self.c_gauss_sampler = Gaussian_Sampler(hidden_sz)
         self.init_weights()
 
     def init_weights(self):
@@ -227,74 +241,51 @@ class c_GLSTMCore(GaussianLSTMCore):
                 nn.init.xavier_uniform_(p.data)
             else:
                 nn.init.zeros_(p.data)
-        scaling = torch.cat([torch.ones(self.hidden_size, self.hidden_size),
-                             torch.ones(self.hidden_size, self.hidden_size) * .00001], dim=1)
-        self.c_reparameterize = torch.nn.Parameter(self.c_reparameterize * scaling)
 
     def forward(self, x: torch.Tensor,
                 init_states=None):
         """Assumes x is of shape (batch, sequence, feature)"""
         bs, seq_sz, _ = x.size()
-        c_stats = []
+        c_mus = []
+        c_stds = []
         if init_states is None:
-            h_t, c_t = (torch.zeros(self.hidden_size).to(x.device),
-                        torch.zeros(self.hidden_size).to(x.device))
+            h_t, c_t = (torch.stack([torch.zeros(self.hidden_size).to(x.device)] * bs, dim=-2),
+                        torch.stack([torch.zeros(self.hidden_size).to(x.device)] * bs, dim=-2))
         else:
             h_t, c_t = init_states
 
         hidden_seq = []
-        c_seq = []
+        h_t = h_t.unsqueeze(dim=0)
+        c_t = c_t.unsqueeze(dim=0)
 
-        HS = self.hidden_size
+        c_t, c_mu, c_std = self.h_gauss_sampler(c_t)
+        c_mus.append(c_mu.squeeze(dim=0))
+        c_stds.append(c_std.squeeze(dim=0))
+
         for t in range(seq_sz):
             x_t = x[:, t, :]
-            # batch the computations into a single matrix multiplication
-            gates = x_t @ self.weight_ih + h_t @ self.weight_hh + self.bias
-            i_t, f_t, g_t, o_t = (
-                torch.sigmoid(gates[:, :HS]),  # input
-                torch.sigmoid(gates[:, HS:HS * 2]),  # forget
-                torch.tanh(gates[:, HS * 2:HS * 3]),
-                torch.sigmoid(gates[:, HS * 3:]),  # output
-            )
-            pre_c_t = f_t * c_t + i_t * g_t
-            pre_h_t = o_t * torch.tanh(c_t)
+            output, (out_h, out_c) = self.lstm(x_t.unsqueeze(dim=1), (h_t, c_t))
+            h_t = out_h
+            c_t, c_mu, c_std = self.c_gauss_sampler(out_c)
+            c_mus.append(c_mu.squeeze(dim=0))
+            c_stds.append(c_std.squeeze(dim=0))
+            hidden_seq.append(h_t)
 
-            # Produce parameters for Gaussian distribution of hidden_size dimensions
-            # sample from Gaussian distribution
-            # otherwise, pass pre_c_t/pre_h_t on as c_t/h_t itself
-            c_params = pre_c_t @ self.c_reparameterize
-            c_mu, c_std, c_t = self.sample(c_params)
-            c_stats.append(torch.cat([c_mu, c_std], dim=Dim.seq).unsqueeze(Dim.batch))
-            h_t = pre_h_t
 
-            # append returnable sequences
-            c_seq.append(c_t.unsqueeze(Dim.batch))
-            hidden_seq.append(h_t.unsqueeze(Dim.batch))
-
-        hidden_seq = torch.cat(hidden_seq, dim=Dim.batch)
-        c_seq = torch.cat(c_seq, dim=Dim.batch)
-
-        # Improvable later, but this section transforms and splits the stats tensors if relevant
-        # Tensor shape B x T x H
-        c_stats = torch.cat(c_stats, dim=Dim.batch)
-        c_stats = c_stats.transpose(Dim.batch, Dim.seq).contiguous()
-        c_stds = c_stats[:, :, self.hidden_size:].contiguous()
-        c_mus = c_stats[:, :, :self.hidden_size].contiguous()
-        h_mus = None
-        h_stds = None
-
+        hidden_seq = torch.cat(hidden_seq)
+        c_mus = torch.stack(c_mus).transpose(Dim.batch, Dim.seq).contiguous()
+        c_stds = torch.stack(c_stds).transpose(Dim.batch, Dim.seq).contiguous()
         # reshape from shape (sequence, batch, feature) to (batch, sequence, feature)
         hidden_seq = hidden_seq.transpose(Dim.batch, Dim.seq).contiguous()
-        c_seq = c_seq.transpose(Dim.batch, Dim.seq).contiguous()
-        return hidden_seq, c_seq, (h_mus, h_stds), (c_mus, c_stds), (h_t, c_t)
+        return hidden_seq, (None, (c_mus,c_stds)), (h_t, c_t)
 
 
-class b_GLSTMCore(GaussianLSTMCore):
+class b_RGLSTM(Recursive_Gaussian_LSTM):
 
     def __init__(self, input_sz: int, hidden_sz: int):
-        super(b_GLSTMCore, self).__init__(input_sz, hidden_sz)
-        self.c_reparameterize = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 2))
-        self.h_reparameterize = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 2))
+        super(b_RGLSTM, self).__init__(input_sz, hidden_sz)
+        self.h_gauss_sampler = Gaussian_Sampler(hidden_sz)
+        self.c_gauss_sampler = Gaussian_Sampler(hidden_sz)
         self.init_weights()
 
     def init_weights(self):
@@ -303,76 +294,94 @@ class b_GLSTMCore(GaussianLSTMCore):
                 nn.init.xavier_uniform_(p.data)
             else:
                 nn.init.zeros_(p.data)
-        scaling = torch.cat([torch.ones(self.hidden_size, self.hidden_size),
-                             torch.ones(self.hidden_size, self.hidden_size) * .00001], dim=1)
-        self.c_reparameterize = torch.nn.Parameter(self.c_reparameterize * scaling)
-        self.h_reparameterize = torch.nn.Parameter(self.h_reparameterize * scaling)
 
     def forward(self, x: torch.Tensor,
                 init_states=None):
         """Assumes x is of shape (batch, sequence, feature)"""
         bs, seq_sz, _ = x.size()
-        c_stats = []
-        h_stats = []
+        h_mus = []
+        h_stds = []
+        c_mus = []
+        c_stds = []
+
         if init_states is None:
-            h_t, c_t = (torch.zeros(self.hidden_size).to(x.device),
-                        torch.zeros(self.hidden_size).to(x.device))
+            h_t, c_t = (torch.stack([torch.zeros(self.hidden_size).to(x.device)]*bs, dim=1),
+                        torch.stack([torch.zeros(self.hidden_size).to(x.device)]*bs, dim=1))
         else:
             h_t, c_t = init_states
 
         hidden_seq = []
-        c_seq = []
+        h_t = h_t.unsqueeze(dim=0)
+        c_t = c_t.unsqueeze(dim=0)
 
-        HS = self.hidden_size
+        #print(h_t.size())
+
+        c_t, c_mu, c_std = self.h_gauss_sampler(c_t)
+        c_mus.append(c_mu.squeeze(dim=0))
+        c_stds.append(c_std.squeeze(dim=0))
+        h_t, h_mu, h_std = self.h_gauss_sampler(h_t)
+        h_mus.append(h_mu.squeeze(dim=0))
+        h_stds.append(h_std.squeeze(dim=0))
+
         for t in range(seq_sz):
             x_t = x[:, t, :]
-            # batch the computations into a single matrix multiplication
-            gates = x_t @ self.weight_ih + h_t @ self.weight_hh + self.bias
-            i_t, f_t, g_t, o_t = (
-                torch.sigmoid(gates[:, :HS]),  # input
-                torch.sigmoid(gates[:, HS:HS * 2]),  # forget
-                torch.tanh(gates[:, HS * 2:HS * 3]),
-                torch.sigmoid(gates[:, HS * 3:]),  # output
-            )
-            pre_c_t = f_t * c_t + i_t * g_t
-            pre_h_t = o_t * torch.tanh(c_t)
+            output, (out_h, out_c) = self.lstm(x_t.unsqueeze(dim=1), (h_t, c_t))
+            h_t, h_mu, h_std = self.h_gauss_sampler(out_h)
+            c_t, c_mu, c_std = self.c_gauss_sampler(out_c)
+            h_mus.append(h_mu.squeeze(dim=0))
+            h_stds.append(h_std.squeeze(dim=0))
+            c_mus.append(c_mu.squeeze(dim=0))
+            c_stds.append(c_std.squeeze(dim=0))
+            hidden_seq.append(h_t)
 
-            # Produce parameters for Gaussian distribution of hidden_size dimensions
-            # sample from Gaussian distribution
-            # otherwise, pass pre_c_t/pre_h_t on as c_t/h_t itself
-            h_params = pre_h_t @ self.h_reparameterize
-            h_mu, h_std, h_t = self.sample(h_params)
-            h_stats.append(torch.cat([h_mu, h_std], dim=Dim.seq).unsqueeze(Dim.batch))
-
-            c_params = pre_c_t @ self.c_reparameterize
-            c_mu, c_std, c_t = self.sample(c_params)
-            c_stats.append(torch.cat([c_mu, c_std], dim=Dim.seq).unsqueeze(Dim.batch))
-
-            # append returnable sequences
-            c_seq.append(c_t.unsqueeze(Dim.batch))
-            hidden_seq.append(h_t.unsqueeze(Dim.batch))
-
-        hidden_seq = torch.cat(hidden_seq, dim=Dim.batch)
-        c_seq = torch.cat(c_seq, dim=Dim.batch)
-
-        # Improvable later, but this section transforms and splits the stats tensors if relevant
-        # Tensor shape B x T x H
-
-        h_stats = torch.cat(h_stats, dim=Dim.batch)
-        h_stats = h_stats.transpose(Dim.batch, Dim.seq).contiguous()
-        h_stds = h_stats[:, :, self.hidden_size:].contiguous()
-        h_mus = h_stats[:, :, :self.hidden_size].contiguous()
-
-        c_stats = torch.cat(c_stats, dim=Dim.batch)
-        c_stats = c_stats.transpose(Dim.batch, Dim.seq).contiguous()
-        c_stds = c_stats[:, :, self.hidden_size:].contiguous()
-        c_mus = c_stats[:, :, :self.hidden_size].contiguous()
-
+        hidden_seq = torch.cat(hidden_seq)
+        h_mus = torch.stack(h_mus).transpose(Dim.batch, Dim.seq).contiguous()
+        h_stds = torch.stack(h_stds).transpose(Dim.batch, Dim.seq).contiguous()
+        c_mus = torch.stack(c_mus).transpose(Dim.batch, Dim.seq).contiguous()
+        c_stds = torch.stack(c_stds).transpose(Dim.batch, Dim.seq).contiguous()
         # reshape from shape (sequence, batch, feature) to (batch, sequence, feature)
         hidden_seq = hidden_seq.transpose(Dim.batch, Dim.seq).contiguous()
-        c_seq = c_seq.transpose(Dim.batch, Dim.seq).contiguous()
-        return hidden_seq, c_seq, (h_mus, h_stds), (c_mus, c_stds), (h_t, c_t)
+        return hidden_seq, ((h_mus, h_stds), (c_mus, c_stds)), (h_t, c_t)
 
+
+class Blanket_Gaussian_LSTM(nn.Module):
+    def __init__(self, input_sz: int, hidden_sz: int, num_layers: int):
+        super(Blanket_Gaussian_LSTM, self).__init__()
+        self.input_sz = input_sz
+        self.hidden_size = hidden_sz
+        self.num_layers = num_layers
+        self.lstm = torch.nn.LSTM(
+            input_size=self.input_sz,
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            batch_first=True
+        )
+
+        self.h_gauss_sampler = Gaussian_Sampler(hidden_sz)
+
+    def init_weights(self):
+        for p in self.parameters():
+            if p.data.ndimension() >= 2:
+                nn.init.xavier_uniform_(p.data)
+            else:
+                nn.init.zeros_(p.data)
+
+    def forward(self, x: torch.Tensor,
+                init_states = None):
+
+        bs, seq_sz, _ = x.size()
+
+        if init_states is None:
+            h_t, c_t = (torch.stack([torch.zeros(self.num_layers, self.hidden_size).to(x.device)] * bs, dim=-2),
+                        torch.stack([torch.zeros(self.num_layers, self.hidden_size).to(x.device)] * bs, dim=-2))
+        else:
+            h_t, c_t = init_states
+        #h_t = h_t.unsqueeze(dim=0)
+        #c_t = c_t.unsqueeze(dim=0)
+        output, (out_h, out_c) = self.lstm(x, (h_t, c_t))
+        h_seq, h_mus, h_stds = self.h_gauss_sampler(torch.cat((torch.transpose(h_t,0,1), output), dim=-2)[:, 0:-1, :])
+
+        return h_seq, (h_mus, h_stds)
 
 class Recursive_Gauss_LSTM(torch.nn.Module):
     def __init__(self, vocab_size, embedding_dim, num_layers, hidden_size, noise, va_z=True,
@@ -391,16 +400,13 @@ class Recursive_Gauss_LSTM(torch.nn.Module):
         self.__build_model()
 
     def get_Z_h(self):
-        #mu = self.Z_h[:, :self.hidden_size].clamp(min=1e-6, max=1e6)
         std = nn.functional.softplus(self.Z_h, beta=1).clamp(min=1e-6)
-
         return std
 
     def get_Z_c(self):
-        #mu = self.Z_c[:, :self.hidden_size].clamp(min=1e-6, max=1e6)
         std = nn.functional.softplus(self.Z_c, beta=1).clamp(min=1e-6)
-
         return std
+
 
     def __build_model(self):
         self.word_embedding = torch.nn.Embedding(
@@ -411,40 +417,36 @@ class Recursive_Gauss_LSTM(torch.nn.Module):
 
         # For the creation of multi-layer LSTMs
         if self.noise == "h":
-            g = [h_GLSTMCore(self.embedding_dim, self.hidden_size)]
+            g = [h_RGLSTM(self.embedding_dim, self.hidden_size)]
             g.extend(
-                [h_GLSTMCore(self.hidden_size, self.hidden_size) for _ in range(1, self.num_layers)])
+                [h_RGLSTM(self.hidden_size, self.hidden_size) for _ in range(1, self.num_layers)])
         if self.noise == "c":
-            g = [c_GLSTMCore(self.embedding_dim, self.hidden_size)]
+            g = [c_RGLSTM(self.embedding_dim, self.hidden_size)]
             g.extend(
-                [c_GLSTMCore(self.hidden_size, self.hidden_size) for _ in range(1, self.num_layers)])
+                [c_RGLSTM(self.hidden_size, self.hidden_size) for _ in range(1, self.num_layers)])
         if self.noise == "both":
-            g = [b_GLSTMCore(self.embedding_dim, self.hidden_size)]
+            g = [b_RGLSTM(self.embedding_dim, self.hidden_size)]
             g.extend(
-                [b_GLSTMCore(self.hidden_size, self.hidden_size) for _ in range(1, self.num_layers)])
+                [b_RGLSTM(self.hidden_size, self.hidden_size) for _ in range(1, self.num_layers)])
 
         if self.va_z:
+            #Initialize cov matrix to be identity matrix
             if self.noise == "h" or self.noise == "both":
-                #Z_h = torch.cat([torch.zeros(self.num_layers, self.hidden_size),
-                Z_h = torch.ones(self.num_layers, self.hidden_size) #], dim=1)
+                Z_h = torch.ones(self.num_layers, self.hidden_size)
                 self.Z_h = torch.nn.Parameter(Z_h)
 
             if self.noise == "c" or self.noise == "both":
-                #Z_c = torch.cat([torch.zeros(self.num_layers, self.hidden_size),
-                Z_c = torch.ones(self.num_layers, self.hidden_size) #], dim=1)
+                Z_c = torch.ones(self.num_layers, self.hidden_size)
                 self.Z_c = torch.nn.Parameter(Z_c)
 
 
 
-        self.gauss_lstm = nn.ModuleList(g)
+        self.rglstm_layers = nn.ModuleList(g)
 
         self.initial_state = torch.nn.Parameter(torch.stack(
             [torch.randn(self.num_layers, self.hidden_size),
              torch.randn(self.num_layers, self.hidden_size)]
         ))
-
-        #if self.has_gauss_layer:
-         #   self.gauss_layer = torch.nn.Parameter(torch.randn())
 
         self.decoder = torch.nn.Linear(self.hidden_size, self.vocab_size)
 
@@ -463,8 +465,8 @@ class Recursive_Gauss_LSTM(torch.nn.Module):
         h_stds = []
         c_stds = []
         seq = embedding
-        for i, layer in enumerate(self.gauss_lstm):
-            seq, c_seq, (h_mu, h_std), (c_mu, c_std), (_, __) = layer(seq, (init_h[i], init_c[i]))
+        for i, layer in enumerate(self.rglstm_layers):
+            seq, ((h_mu, h_std), (c_mu, c_std)), (_, __) = layer(seq, (init_h[i], init_c[i]))
             c_mus.append(c_mu)
             c_stds.append(c_std)
             h_mus.append(h_mu)
@@ -473,24 +475,22 @@ class Recursive_Gauss_LSTM(torch.nn.Module):
         # If noise flag "h"/"c", transforms them, otherwise don't touch because it's a NoneType
 
         if self.noise == "c" or self.noise == "both":
-            c_mus = torch.cat(c_mus, Dim.feature)
-            c_stds = torch.cat(c_stds, Dim.feature)
+            c_mus = torch.cat(c_mus, Dim.feature)[:, 0:-1, :]
+            c_stds = torch.cat(c_stds, Dim.feature)[:, 0:-1, :]
 
         if self.noise == "h" or self.noise == "both":
-            h_mus = torch.cat(h_mus, Dim.feature)
-            h_stds = torch.cat(h_stds, Dim.feature)
+            h_mus = torch.cat(h_mus, Dim.feature)[:, 0:-1, :]
+            h_stds = torch.cat(h_stds, Dim.feature)[:, 0:-1, :]
 
-        c_stats = (c_mus, c_stds)
-        h_stats = (h_mus, h_stds)
+        c_dists = (c_mus, c_stds)
+        h_dists = (h_mus, h_stds)
 
         # Also need to include the initial state itself
         # And the last state is after consuming EOS, so it doesn't matter
         # So add the initial state in first, and remove the final state
-
         seq = torch.cat((init_h[-1].unsqueeze(-2), seq), dim=-2)[:, 0:-1, :]
-        c_seq = torch.cat((init_c[-1].unsqueeze(-2), c_seq), dim=-2)[:, 0:-1, :]
 
-        return seq, c_seq, h_stats, c_stats
+        return seq, (h_dists, c_dists)
 
     def decode(self, h):
         logits = self.decoder(h)
@@ -498,19 +498,19 @@ class Recursive_Gauss_LSTM(torch.nn.Module):
         logits[:, :, self.padding_idx] = -INF
         return torch.log_softmax(logits, -1)
 
-    def lm_loss(self, Y, Y_hat):
+    def lm_loss(self, y, y_hat):
         # Y contains the target token indices. Shape B x T
         # Y_hat contains distributions
-        Y_flat = Y.view(-1)  # flatten to B*T
-        Y_hat_flat = Y_hat.view(-1, self.vocab_size)  # flatten to B*T x V
-        mask = (Y_flat == self.padding_idx)
+        y_flat = y.view(-1)  # flatten to B*T
+        y_hat_flat = y_hat.view(-1, self.vocab_size)  # flatten to B*T x V
+        mask = (y_flat == self.padding_idx)
         num_tokens = torch.sum(~mask).item()
-        Y_hat_correct = Y_hat_flat[range(Y_hat_flat.shape[0]), Y_flat]
-        Y_hat_correct[mask] = 0
-        ce_loss = -torch.sum(Y_hat_correct) / num_tokens
+        y_hat_correct = y_hat_flat[range(y_hat_flat.shape[0]), y_flat]
+        y_hat_correct[mask] = 0
+        ce_loss = -torch.sum(y_hat_correct) / num_tokens
         return ce_loss
 
-    def mi_loss(self, stats, Y, dist):
+    def mi_loss(self, stats, y, dist):
         if self.va_z:
             if dist == "h":
                 std_z = self.get_Z_h()
@@ -519,30 +519,24 @@ class Recursive_Gauss_LSTM(torch.nn.Module):
             mu_z = torch.zeros(self.hidden_size).to("cuda")
             std = stats[1]
             mu = stats[0]
-            mask = (Y != self.padding_idx)
+            mask = (y != self.padding_idx)
             std_flat = std.contiguous()[mask, :]
             mu_flat = mu.contiguous()[mask, :]
-            n = mask.sum()
-            #mi_loss = torch.stack([kl_divergence(mu,std_flat[i],mu_z,std_z) for i,mu in enumerate(mu_flat)]).sum()/n
-            mi_loss = kl_divergence(mu_flat,std_flat,mu_z,std_z).mean()
-            return mi_loss
+            mi_loss = kl_divergence(mu_flat, std_flat, mu_z, std_z)
 
         else:
             std = stats[1]  # stats[:,:,self.hidden_size:].contiguous()
             mu = stats[0]  # [:, :, :self.hidden_size].contiguous()
-            mask = (Y != self.padding_idx)
-            n = mask.sum()
+            mask = (y != self.padding_idx)
+            #n = mask.sum()
 
             std_flat = std.contiguous()[mask, :]  # B*TxH remove padded entries
-
-            # std_flat = std_flat.clamp(min=1e-8)
             mu_flat = mu.contiguous()[mask, :]  # B*TxH, ditto
 
             mi_loss = (-(1 / 2) * (std_flat.log().sum(dim=1) + self.hidden_size -
                                    (mu_flat ** 2).sum(dim=1) - std_flat.sum(dim=1)))
-            # print(mi_loss.isinf().any())
 
-            return mi_loss.sum() / n
+        return mi_loss.mean()
 
     def pmi(self, stats):
         std = stats[1]
@@ -569,14 +563,14 @@ class Recursive_Gauss_LSTM(torch.nn.Module):
                 w = n / m
                 padded_batch = pad_sequences(batch)
                 padded_batch = padded_batch.to("cuda")
-                hidden_seq, c_seq, h_stats, c_stats = self.encode(padded_batch)
+                hidden_seq, (h_dists, c_dists) = self.encode(padded_batch)
                 y_hat = self.decode(hidden_seq)  # shape B x (T+1) x V ???
                 if self.noise == "h" or self.noise == "both":
-                    hib_loss = self.mi_loss(h_stats, padded_batch, "h")
+                    hib_loss = self.mi_loss(h_dists, padded_batch, "h")
                 else:
                     hib_loss = 0
                 if self.noise == "c" or self.noise == "both":
-                    cib_loss = self.mi_loss(c_stats, padded_batch, "c")
+                    cib_loss = self.mi_loss(c_dists, padded_batch, "c")
                 else:
                     cib_loss = 0
                 ce_loss = self.lm_loss(padded_batch, y_hat)
@@ -708,7 +702,7 @@ class Recursive_Gauss_LSTM(torch.nn.Module):
     def distro_after(self, sequence):
         sequence = list(sequence) + [PADDING_IDX]
         padded = pad_sequences([sequence])
-        hidden_seq, c_seq, h_stats, c_stats = self.encode(padded)
+        hidden_seq, (_, __) = self.encode(padded)
         predicted = self.decode(hidden_seq)[0, -1, :]
         return predicted
 
@@ -779,12 +773,7 @@ class Blanket_Gauss_LSTM(torch.nn.Module):
             padding_idx=self.padding_idx
         )
 
-        self.lstm = torch.nn.LSTM(
-            input_size=self.embedding_dim,
-            hidden_size=self.hidden_size,
-            num_layers=self.num_layers,
-            batch_first=True
-        )
+        self.lstm = Blanket_Gaussian_LSTM(self.embedding_dim, self.hidden_size, self.num_layers)
 
         self.initial_state = torch.nn.Parameter(torch.stack(
             [torch.randn(self.num_layers, self.hidden_size),
@@ -802,14 +791,11 @@ class Blanket_Gauss_LSTM(torch.nn.Module):
         batch_size, seq_len = X.shape
         embedding = self.word_embedding(X)
         init_h, init_c = self.get_initial_state(batch_size)  # init_h is L x B x H
-        output, (out_h, out_c) = self.lstm(embedding, (init_h, init_c))  # output is B x T x H
+        h_seq, (h_mus, h_stds) = self.lstm(embedding, (init_h, init_c))  # output is B x T x H
         # Also need to include the initial state itself
         # And the last state is after consuming EOS, so it doesn't matter
         # So add the initial state in first, and remove the final state
-        statistics = torch.cat((init_h[-1].unsqueeze(-2), output), dim=-2)[:, 0:-1, :]
-        mu, std, z = self.sample(statistics)
-        returnable_stats = torch.cat()
-        return mu, std, z
+        return h_seq, (h_mus, h_stds)
 
     def decode(self, h):
         logits = self.decoder(h)
@@ -833,10 +819,10 @@ class Blanket_Gauss_LSTM(torch.nn.Module):
                 w = n / m
                 padded_batch = pad_sequences(batch)
                 padded_batch = padded_batch.to("cuda")
-                statistics, z = self.encode(padded_batch)
-                y_hat = self.decode(z)  # shape B x (T+1) x V ???
+                h_seq, h_stats = self.encode(padded_batch)
+                y_hat = self.decode(h_seq)  # shape B x (T+1) x V ???
                 ce_loss = self.lm_loss(padded_batch, y_hat)
-                ib_loss = self.mi_loss()
+                ib_loss = self.mi_loss(h_stats, y_hat, "h")
                 loss = beta * ib_loss + ce_loss
                 avg_loss += loss * w
                 avg_ce_loss += ce_loss * w
@@ -903,34 +889,45 @@ class Blanket_Gauss_LSTM(torch.nn.Module):
 
         return avg_hib_loss, avg_cib_loss
 
-    def lm_loss(self, Y, Y_hat):
+    def lm_loss(self, y, y_hat):
         # Y contains the target token indices. Shape B x T
         # Y_hat contains distributions
-        Y_flat = Y.view(-1)  # flatten to B*T
-        Y_hat_flat = Y_hat.view(-1, self.vocab_size)  # flatten to B*T x V
-        mask = (Y_flat == self.padding_idx)
+        y_flat = y.view(-1)  # flatten to B*T
+        y_hat_flat = y_hat.view(-1, self.vocab_size)  # flatten to B*T x V
+        mask = (y_flat == self.padding_idx)
         num_tokens = torch.sum(~mask).item()
-        Y_hat_correct = Y_hat_flat[range(Y_hat_flat.shape[0]), Y_flat]
-        Y_hat_correct[mask] = 0
-        ce_loss = -torch.sum(Y_hat_correct) / num_tokens
+        y_hat_correct = y_hat_flat[range(y_hat_flat.shape[0]), y_flat]
+        y_hat_correct[mask] = 0
+        ce_loss = -torch.sum(y_hat_correct) / num_tokens
         return ce_loss
 
-    def mi_loss(self, stats, Y):
-        std = stats[1]  # stats[:,:,self.hidden_size:].contiguous()
-        mu = stats[0]  # [:, :, :self.hidden_size].contiguous()
-        mask = (Y != self.padding_idx)
-        n = mask.sum()
+    def mi_loss(self, stats, y, dist):
+        if self.va_z:
+            if dist == "h":
+                std_z = self.get_Z_h()
+            else:
+                std_z = self.get_Z_c()
+            mu_z = torch.zeros(self.hidden_size).to("cuda")
+            std = stats[1]
+            mu = stats[0]
+            mask = (y != self.padding_idx)
+            std_flat = std.contiguous()[mask, :]
+            mu_flat = mu.contiguous()[mask, :]
+            mi_loss = kl_divergence(mu_flat, std_flat, mu_z, std_z)
 
-        std_flat = std.contiguous()[mask, :]  # B*TxH remove padded entries
+        else:
+            std = stats[1]  # stats[:,:,self.hidden_size:].contiguous()
+            mu = stats[0]  # [:, :, :self.hidden_size].contiguous()
+            mask = (y != self.padding_idx)
+            # n = mask.sum()
 
-        # std_flat = std_flat.clamp(min=1e-8)
-        mu_flat = mu.contiguous()[mask, :]  # B*TxH, ditto
+            std_flat = std.contiguous()[mask, :]  # B*TxH remove padded entries
+            mu_flat = mu.contiguous()[mask, :]  # B*TxH, ditto
 
-        mi_loss = (-(1 / 2) * (std_flat.log().sum(dim=1) + self.hidden_size -
-                               (mu_flat ** 2).sum(dim=1) - std_flat.sum(dim=1)))
-        # print(mi_loss.isinf().any())
+            mi_loss = (-(1 / 2) * (std_flat.log().sum(dim=1) + self.hidden_size -
+                                   (mu_flat ** 2).sum(dim=1) - std_flat.sum(dim=1)))
 
-        return mi_loss.sum() / n
+        return mi_loss.mean()
 
     #def pmi(self, stats):
 
@@ -1023,7 +1020,7 @@ def read_unimorph(filename, field=1):
 #
 
 
-def train_unimorph_recursive_lm(lang, hidden_size=100, num_layers=2, batch_size=2048, num_epochs=200, print_every=2,
+def train_unimorph_recursive_lm(lang, hidden_size=100, num_layers=2, batch_size=2048, num_epochs=50, print_every=2,
                       embedding_dim = 20, noise="h", beta_start = .0005, beta_end= .005, annealing = "none", va = True, **kwds):
     data, vocab, indexer = list(format_sequences(read_unimorph("%s" % lang)))
     print("Loaded data for %s..." % lang, file=sys.stderr)
@@ -1036,10 +1033,11 @@ def train_unimorph_recursive_lm(lang, hidden_size=100, num_layers=2, batch_size=
                                                             print_every=int(print_every), beta_start=beta_start, beta_end=beta_end,
                                                             alpha_start=beta_start, alpha_end=beta_end, annealing = annealing, **kwds)
     lstm.to("cpu")
-    #print("Generating %d samples..." % num_samples, file=sys.stderr)
-    #for _ in range(num_samples):
-       #symbols = list(lstm.generate())[:-1]
-        #print("".join(map(vocab.__getitem__, symbols)), file=sys.stderr)
+    num_samples = 10
+    print("Generating %d samples..." % num_samples, file=sys.stderr)
+    for _ in range(num_samples):
+        symbols = list(lstm.generate())[:-1]
+        print("".join(map(vocab.__getitem__, symbols)), file=sys.stderr)
     #lstm.mi_read(indexer.format_sequence("bending"))
 
     #torch.save(lstm, "char_model.lstm")
